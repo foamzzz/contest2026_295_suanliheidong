@@ -1,0 +1,30 @@
+esptool v5.3.1
+Image size: 203816 bytes
+
+ESP32-S3 Image Header
+=====================
+Image version: 1
+Entry point: 0x40374f2c
+Segments: 2
+Flash size: 16MB
+Flash freq: 40m
+Flash mode: DIO
+
+ESP32-S3 Extended Image Header
+==============================
+WP pin: 0xee (disabled)
+Flash pins drive settings: clk_drv: 0x0, q_drv: 0x0, d_drv: 0x0, cs0_drv: 0x0, hd_drv: 0x0, wp_drv: 0x0
+Chip ID: 9 (ESP32-S3)
+Minimal chip revision: v0.0, (legacy min_rev = 0)
+Maximal chip revision: v655.35
+
+Segments Information
+====================
+Segment   Length   Load addr   File offs  Memory types
+-------  -------  ----------  ----------  ------------
+      0  0x00f14  0x3fc8b840  0x00000018  BYTE_ACCESSIBLE, MEM_INTERNAL, DRAM
+      1  0x0579c  0x40374000  0x00000f34  MEM_INTERNAL, IRAM
+
+ESP32-S3 Image Footer
+=====================
+Checksum: 0xf9 (valid)

@@ -1,5 +1,5 @@
 /****************************************************************************
- * board/contest_board/src/board_boot.c
+ * board/contest_board/src/board_appinit.c
  *
  * SPDX-License-Identifier: Apache-2.0
  ****************************************************************************/
@@ -10,33 +10,29 @@
 
 #include <nuttx/config.h>
 
+#include <stdint.h>
+
+#include <nuttx/board.h>
+
 #include "contest_board.h"
 
+#ifdef CONFIG_BOARDCTL
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
 
 /****************************************************************************
- * Name: esp32s3_board_initialize
- *
- * Description:
- *   This entry point runs after memory setup and before device
- *   initialization.  The minimum board has no verified peripheral that
- *   requires early initialization.
- *
+ * Name: board_app_initialize
  ****************************************************************************/
 
-void esp32s3_board_initialize(void)
+int board_app_initialize(uintptr_t arg)
 {
-}
+  (void)arg;
 
 #ifdef CONFIG_BOARD_LATE_INITIALIZE
-/****************************************************************************
- * Name: board_late_initialize
- ****************************************************************************/
-
-void board_late_initialize(void)
-{
-  (void)contest_board_bringup();
-}
+  return OK;
+#else
+  return contest_board_bringup();
 #endif
+}
+#endif /* CONFIG_BOARDCTL */

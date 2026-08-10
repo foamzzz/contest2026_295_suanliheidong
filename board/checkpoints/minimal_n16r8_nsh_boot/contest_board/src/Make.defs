@@ -1,0 +1,17 @@
+############################################################################
+# board/contest_board/src/Make.defs
+#
+# SPDX-License-Identifier: Apache-2.0
+############################################################################
+
+include $(TOPDIR)/Make.defs
+
+CSRCS = board_boot.c board_bringup.c
+
+ifeq ($(CONFIG_BOARDCTL),y)
+CSRCS += board_appinit.c
+endif
+
+DEPPATH += --dep-path board
+VPATH += :board
+CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)arch$(DELIM)$(CONFIG_ARCH)$(DELIM)src$(DELIM)board$(DELIM)board

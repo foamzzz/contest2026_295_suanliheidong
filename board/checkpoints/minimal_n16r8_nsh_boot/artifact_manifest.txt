@@ -1,0 +1,13 @@
+Build command:
+contest2026_295_suanliheidong/board/contest_board/scripts/build_with_hal_backport.sh -j8
+
+Artifacts are not copied into this checkpoint. They remain in the openvela
+workspace at the paths below.
+
+5891748 bytes  nuttx/nuttx
+203816 bytes  nuttx/nuttx.bin
+313906 bytes  nuttx/nuttx.hex
+
+f1d4125d9781433d171d94d80aff981280a5d27b9f492a13bf070a83dc0ff8a8  nuttx/nuttx
+8cc979f6038e1bd292b9d35a6ad52e63a5ae16881be4cc950073f5e9a2832f3d  nuttx/nuttx.bin
+940d300204e1f154add823b03431d3216a476d87c26052a2583f283a1279e5ce  nuttx/nuttx.hex
