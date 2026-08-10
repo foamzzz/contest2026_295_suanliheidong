@@ -30,7 +30,7 @@ int board_app_initialize(uintptr_t arg)
   (void)arg;
 
 #ifdef CONFIG_BOARD_LATE_INITIALIZE
-  return OK;
+  return 0;
 #else
   return contest_board_bringup();
 #endif

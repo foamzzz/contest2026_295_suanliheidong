@@ -6,4 +6,12 @@ if ARCH_BOARD_CUSTOM
 
 comment "Contest 2026 team 295 ESP32-S3 board options"
 
+config CONTEST_BOARD_BUTTONS
+	bool "Contest board GPIO button support"
+	default n
+	select ARCH_HAVE_BUTTONS
+	select ARCH_HAVE_IRQBUTTONS
+	---help---
+		Enable the GPIO14 touch button and GPIO0 boot button board interfaces.
+
 endif # ARCH_BOARD_CUSTOM

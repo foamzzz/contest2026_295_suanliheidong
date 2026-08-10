@@ -49,6 +49,33 @@
 
 #define BOARD_XTAL_FREQUENCY    40000000
 
+/* Verified peripheral GPIO map ********************************************/
+
+#define LED_GPIO_PIN                 4
+#define TOUCH_BUTTON_GPIO            14
+#define BOOT_BUTTON_GPIO             0
+
+#define DISPLAY_SDA_PIN              12
+#define DISPLAY_SCL_PIN              13
+
+#define RIGHT_FRONT_LEG_PIN          9
+#define RIGHT_REAR_LEG_PIN           10
+#define LEFT_REAR_LEG_PIN            21
+#define LEFT_FRONT_LEG_PIN           47
+#define TAIL_SERVO_PIN               48
+
+#define AUDIO_I2S_MIC_GPIO_SCK       16
+#define AUDIO_I2S_MIC_GPIO_WS        17
+#define AUDIO_I2S_MIC_GPIO_DIN       18
+
+#define AUDIO_I2S_SPK_GPIO_LRCK      38
+#define AUDIO_I2S_SPK_GPIO_BCLK      39
+#define AUDIO_I2S_SPK_GPIO_DOUT      40
+
+#define CONTEST_BOARD_BUTTON_TOUCH   0
+#define CONTEST_BOARD_BUTTON_BOOT    1
+#define CONTEST_BOARD_NBUTTONS       2
+
 #ifdef CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ
 #  define BOARD_CLOCK_FREQUENCY \
     (CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ * 1000000)

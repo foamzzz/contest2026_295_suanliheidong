@@ -8,6 +8,10 @@ include $(TOPDIR)/Make.defs
 
 CSRCS = board_boot.c board_bringup.c
 
+ifeq ($(CONFIG_ARCH_BUTTONS),y)
+CSRCS += board_buttons.c
+endif
+
 ifeq ($(CONFIG_BOARDCTL),y)
 CSRCS += board_appinit.c
 endif

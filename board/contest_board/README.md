@@ -8,7 +8,8 @@
 - UART0 + NSH: PASS
 - Wi-Fi: DISABLED
 - Bluetooth: DISABLED
-- LCD/Camera/Audio: DISABLED
+- LCD/Camera: DISABLED
+- I2S lower-halves: ADAPTED (no codec or audio application)
 - `-j8` build: PASS
 - `nuttx.bin`: PASS
 - Hardware boot: PASS
@@ -16,8 +17,8 @@
 
 PSRAM runtime stress test: NOT YET VERIFIED.
 
-This checkpoint is intentionally a minimal NSH board. Do not add optional
-peripherals or application features until the next stage.
+Stage 2 retains the minimal NSH boot path and adds board-resource adaptation
+only. It does not add peripheral application behavior.
 
 ## 2. Hardware Parameters
 
@@ -28,7 +29,39 @@ peripherals or application features until the next stage.
 - UART0 RX: GPIO44
 - UART baud: 115200
 
-## 3. Environment Preparation
+## 3. Peripheral Bring-up
+
+The board registration and NSH device nodes were verified on hardware. The
+actual OLED rendering, servo motion, microphone capture, and speaker playback
+remain functional tests for later stages.
+
+| Resource | GPIO / controller | Board adaptation |
+| --- | --- | --- |
+| LED | GPIO4 | GPIO output; boot level LOW. LED active polarity is unknown. |
+| Touch Button | GPIO14 | Ordinary GPIO button input. |
+| Boot Button | GPIO0 | Ordinary GPIO button input after normal boot. Do not hold it during reset: it may enter ROM download mode. |
+| OLED I2C | I2C0, SDA GPIO12, SCL GPIO13 | `/dev/i2c0`; `i2c` tool defaults to 400 kHz. No OLED controller driver is registered. |
+| Servo PWM | GPIO9, GPIO10, GPIO21, GPIO47, GPIO48 | ESP32-S3 LEDC timer 0 with five channels, registered as `/dev/pwm0`. 50 Hz is the intended runtime frequency; the resource remains disabled until a client starts PWM. |
+| MIC I2S RX | I2S0: BCLK GPIO16, WS GPIO17, DIN GPIO18 | Master RX lower-half initialized. |
+| Speaker I2S TX | I2S1: WS GPIO38, BCLK GPIO39, DOUT GPIO40 | Master TX lower-half initialized. |
+
+I2S0 is permanently assigned to microphone RX and I2S1 to speaker TX for this
+board configuration. The current ESP32-S3 driver defaults to 16-bit, 44100 Hz
+until a future client configures a stream; those values are temporary driver
+defaults, not hardware-validated microphone or speaker settings. No I2S
+character device is registered, by design.
+
+Future non-actuating NSH registration checks:
+
+```text
+ls /dev
+i2c -h
+```
+
+Do not issue PWM start commands until the servo wiring and safe pulse policy
+are hardware-validated.
+
+## 4. Environment Preparation
 
 Run from the openvela workspace root:
 
@@ -47,7 +80,7 @@ python -m esptool version
 The build wrapper also activates `myenv`, but activating it explicitly keeps
 all manual image inspection and flashing commands on esptool 5.3.1.
 
-## 4. Correct Build Method
+## 5. Correct Build Method
 
 Do not use the ordinary `build.sh` command directly for this board. Use:
 
@@ -70,13 +103,13 @@ contest2026_295_suanliheidong/board/contest_board/scripts/build_with_hal_backpor
   -j8 2>&1 | tee ~/contest-board-build.log
 ```
 
-## 5. Build Artifacts
+## 6. Build Artifacts
 
 - `nuttx/nuttx`: ELF for debugging.
 - `nuttx/nuttx.bin`: image to flash.
 - `nuttx/nuttx.hex`: Intel HEX image.
 
-## 6. Image Verification
+## 7. Image Verification
 
 Before every flash, verify the generated image:
 
@@ -94,7 +127,7 @@ checksum. ROM-visible load segments must use valid DRAM/IRAM addresses such as
 
 Do not add `--use_segments` or `--use-segments` to `elf2image`.
 
-## 7. Flashing
+## 8. Flashing
 
 This board uses a NuttX Simple Boot single image. Do not add ESP-IDF
 `bootloader.bin` or `partition-table.bin`.
@@ -115,7 +148,7 @@ python -m esptool \
   nuttx/nuttx.bin
 ```
 
-## 8. USB-TTL Wiring
+## 9. USB-TTL Wiring
 
 - USB-TTL RXD -> GPIO43
 - USB-TTL TXD -> GPIO44
@@ -123,7 +156,7 @@ python -m esptool \
 - USB-TTL 3V3/5V -> do not connect
 - Board -> independent stable 5V supply
 
-## 9. Serial Boot
+## 10. Serial Boot
 
 ```bash
 picocom -b 115200 --flow n /dev/ttyUSB0
@@ -139,7 +172,7 @@ NuttShell (NSH)
 nsh>
 ```
 
-## 10. Minimal NSH Verification
+## 11. Minimal NSH Verification
 
 Run:
 
@@ -155,19 +188,24 @@ echo hello_openvela
 
 `free` and `ps` are absent in this minimal configuration by design.
 
-## 11. Disabled Features
+## 12. Not Implemented Yet
 
 - Wi-Fi disabled
 - Bluetooth disabled
 - LCD disabled
 - Camera disabled
-- Audio disabled
+- OLED controller, framebuffer, graphics, and LVGL
+- Microphone functional capture
+- Speaker functional playback
+- Servo motion
+- Application behavior
 
-These features have not been ported or validated for this board.
+Wi-Fi, Bluetooth, LCD, and Camera remain disabled. No codec, audio player, or
+audio recorder application is enabled.
 
-## 12. Important Special Changes
+## 13. Important Special Changes
 
-### 12.1 Important Compatibility Patch / Upstream Backport
+### 13.1 Important Compatibility Patch / Upstream Backport
 
 The NuttX integration pins `esp-hal-3rdparty` to base revision
 `9fc713a95b1ff150dd0b0647e465d3c624056bb1`. That revision defines
@@ -190,7 +228,7 @@ HAL revisions change directory layout and do not match this NuttX `hal.mk`.
 After the wrapper exits, HAL must return to the pinned base revision with an
 empty tracked diff.
 
-### 12.2 Important Image Generation Fix / Do Not Reintroduce `--use_segments`
+### 13.2 Important Image Generation Fix / Do Not Reintroduce `--use_segments`
 
 The former board `scripts/esptool.py` injected `--use_segments` into
 `elf2image`. That made esptool interpret ELF Program Header PhysAddr values
@@ -203,13 +241,13 @@ esptool in its default section mode while retaining `--ram-only-header` from
 the NuttX build command. Reintroducing `--use_segments` or `--use-segments`
 will create a non-bootable `nuttx.bin`.
 
-### 12.3 `board_bringup` Return Value
+### 13.3 `board_bringup` Return Value
 
 `src/board_bringup.c` returns `0` on success. Do not change it back to
 `return OK;` unless the correct header provides `OK` and its necessity has
 been verified.
 
-## 13. Repository Modification Boundary
+## 14. Repository Modification Boundary
 
 Allowed long-term board maintenance:
 
@@ -220,7 +258,7 @@ contest2026_295_suanliheidong/board/contest_board/**
 Do not directly maintain changes in HAL, NuttX tracked source, vendor tracked
 source, or packages tracked source.
 
-## 14. Current Non-Blocking Messages
+## 15. Current Non-Blocking Messages
 
 The current build may report:
 
@@ -230,15 +268,9 @@ The current build may report:
 
 These messages did not block the frozen minimal NSH build.
 
-## 15. Next Stage
+## 16. Future Work
 
-Only the next stage may add:
-
-- PSRAM runtime verification
-- GPIO
-- Wi-Fi
-- Bluetooth
-- Peripherals
-- Application features
-
-Do not mix next-stage code into this checkpoint.
+The next stage should perform the hardware functional tests intentionally
+excluded here: verify GPIO electrical polarity, probe I2C, check I2S capture
+and playback with identified external devices, and define a servo safety
+policy before issuing PWM start requests.
