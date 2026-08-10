@@ -1,0 +1,20 @@
+{
+  "schema_version": "1.0",
+  "team_id": "contest2026_295_suanliheidong",
+  "github_login": "foamzzz",
+  "generator": "codex-collector@1.2.0",
+  "updated_at": "2026-08-08T17:15:19.885Z",
+  "sessions": [
+    {
+      "session_id": "019fe116-ca59-7841-a4a0-0f954a738fdd",
+      "tool": "codex",
+      "started_at": "2026-08-08T11:19:14.739Z",
+      "last_event_at": "2026-08-08T17:15:19.881Z",
+      "event_count": 634,
+      "raw_event_count": 1730,
+      "file_path": "logs/foamzzz/2026-08-08/codex__019fe116-ca59-7841-a4a0-0f954a738fdd.jsonl",
+      "collection_mode": "cli",
+      "health": "ok"
+    }
+  ]
+}
