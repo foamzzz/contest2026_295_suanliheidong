@@ -1,0 +1,20 @@
+artifact: nuttx-b3.1-tools-heap-gate-v2-monotonic-cache
+baseline_elf: contest2026_295_suanliheidong/artifacts/ai_agent_stabilization/nuttx-b3.1-tools-heap-gate-v2.elf
+baseline_bin: contest2026_295_suanliheidong/artifacts/ai_agent_stabilization/nuttx-b3.1-tools-heap-gate-v2.bin
+baseline_elf_sha256: 18af7793eae483266a0460a5d0520d0fb81c8f068086b5393983e113840ea06b
+baseline_bin_sha256: 33572891122ff35fc53961c36ec94d5e5d2cfa56d4e75f26c77a2db6164a89fa
+nuttx_source_revision: 76354c637858ecb0aa4601629327acb6f44a26bb
+ai_agent_base_revision: 41723c61725c4e845bfee724f3ad2fafc416b6e1
+defconfig: contest2026_295_suanliheidong/board/contest_board/configs/nsh/defconfig
+defconfig_sha256: 07a483fe0cf471f9a3c247cf5d85d8c9bfa72d9d23f499356deb23e2a9264331
+build_config_sha256: 1c08df1aad094a1959443d704dff735392be26195cd92840336d5e684b281138
+stack: 0003,0004,0005,0006,0014
+patch: contest2026_295_suanliheidong/board/contest_board/patches/0021-ai-agent-monotonic-llm-cache-v2.patch
+patch_sha256: 10e07f36a72e0e65d891c9bbcaf5fdbb9e836a686f395112393cd2c0b3705971
+build_command: TMPDIR=/tmp/ai-agent-state-v2d AI_AGENT_B31=1 AI_AGENT_B32=0 AI_AGENT_VARIANT_PATCH=0014-ai-agent-tools-heap-gate-v2.patch contest2026_295_suanliheidong/board/contest_board/scripts/build_with_hal_backport.sh -j8
+elf: contest2026_295_suanliheidong/artifacts/ai_agent_stabilization/nuttx-b3.1-tools-heap-gate-v2-monotonic-cache.elf
+bin: contest2026_295_suanliheidong/artifacts/ai_agent_stabilization/nuttx-b3.1-tools-heap-gate-v2-monotonic-cache.bin
+elf_sha256: 2e1b72a7301c2e11eb64d22a6325d85eece5a5810921c239a30520febd4c17f1
+bin_sha256: cdd45cb07a07db4e2ce50b18b1829b385ec2a63d97f3fde5838493c85a17993b
+image_info: ESP32-S3, 2 RAM segments, checksum valid
+hardware: not flashed; real-machine acceptance not run

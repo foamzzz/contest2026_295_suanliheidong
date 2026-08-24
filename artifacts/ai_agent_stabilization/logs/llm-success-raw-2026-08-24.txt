@@ -1,0 +1,177 @@
+vela> ask time
+[CPU0] [BUS-DIAG] producer push begin source=cli:console len=4
+[CPU0] [BUS-DIAG] producer bus=0x3fc99008
+[CPU0] [BUS-DIAG] producer push end rc=0
+[CPU0] [agent] ask: time[CPU0] [BUS-DIAG] consumer pop rc=0 source=cli len=4
+
+[CPU0] [ASK-DIAG] inbound
+[CPU0] [agent] Processing message from cli:console
+Sent to agent: time
+vela> [CPU0] [skills] Skills summary: 814 bytes
+[CPU0] [context] System prompt built: 3289 bytes
+[CPU0] [AI-DOG-DIAG] ask stage=prompt
+[CPU0] [AI-DOG-DIAG] ask stage=tools bytes=9946
+[CPU0] [AI-DOG-DIAG] ask stage=messages
+[CPU0] [AI-DOG-DIAG] ask stage=react
+[CPU0] [llm] LLM config updated atomically: token-plan-cn.xiaomimimo.com/v1/chat/completions (model: mimo-v2.5)
+[CPU0] [trace:0000002700000000] BEGIN chat=console chan=cli
+[CPU0] [ASK-DIAG] llm_begin
+[CPU0] [MEM-DIAG] phase=LLM_PRE internal free=60016 largest=40856 psram free=8331208 largest=8331208 combined free=8391224 largest=8331208
+[CPU0] [HEAP-GATE] TOOLS_PARSED PASS
+[CPU0] [llm] OpenAI API with tools (model: mimo-v2.5, 14863 bytes)
+[CPU0] [ASK-DIAG] http send begin bytes=14863
+[CPU0] [TLS-PROBE] begin host=token-plan-cn.xiaomimimo.com port=443
+[CPU0] [TLS-PROBE] entropy init
+[CPU0] [TLS-PROBE] ctr_drbg seed begin
+[CPU0] [TLS-PROBE] ctr_drbg seed ret=0
+[CPU0] [TLS-PROBE] time check unix=39
+[CPU0] [vela_tls] Handshake start: Host=token-plan-cn.xiaomimimo.com, UNIX=39
+[CPU0] [vela_tls] Clock too old, forcing to 2026
+[CPU0] [TLS-PROBE] time set begin
+[CPU0] [TLS-PROBE] time set done rc=0 errno=0
+[CPU0] [TLS-PROBE] dns begin
+[CPU0] [TLS-PROBE] socket begin
+[CPU0] [TLS-PROBE] tcp connect begin
+[CPU0] [agent] Dispatching response → cli:console
+[CPU0] [agent] [Agent]: 让我查一下...
+
+[Agent]: 让我查一下...
+vela> [CPU0] [TLS-PROBE] dns done
+[CPU0] [TLS-PROBE] socket fd=3
+[CPU0] [TLS-PROBE] tcp connect ret=0
+[CPU0] [TLS-PROBE] ssl config begin
+[CPU0] [TLS-PROBE] ssl setup begin
+[CPU0] [TLS-PROBE] ssl setup ret=0
+[CPU0] [TLS-PROBE] set hostname
+[CPU0] [TLS-PROBE] set hostname ret=0
+[CPU0] [TLS-PROBE] set bio
+[CPU0] [TLS-PROBE] handshake call begin
+[CPU0] [TLS-PROBE] handshake ret=0
+[CPU0] [vela_tls] Handshake OK: TLSv1.2 / TLS-ECDHE-RSA-WITH-CHACHA20-POLY1305-SHA256
+[CPU0] [ASK-DIAG] tls handshake ok
+[CPU0] [TLS-PROBE] handshake ok
+[CPU0] [ASK-DIAG] http send begin bytes=15119
+[CPU0] [TLS-PROBE] send begin bytes=15119
+[CPU0] [ASK-DIAG] http send ret=256 errno=2
+[CPU0] [TLS-PROBE] send ret=256 errno=2
+[CPU0] [ASK-DIAG] http send ret=14863 errno=2
+[CPU0] [TLS-PROBE] send ret=14863 errno=2
+[CPU0] [ASK-DIAG] http recv begin
+[CPU0] [TLS-PROBE] recv begin
+[CPU0] [ASK-DIAG] http recv ret=932 errno=2
+[CPU0] [TLS-PROBE] recv ret=932 errno=2
+[CPU0] [HTTP-DIAG] response complete status=200
+[CPU0] [ASK-DIAG] http header parsed
+[CPU0] [ASK-DIAG] http body bytes=603
+[CPU0] [TLS-PROBE] recv body bytes=603
+[CPU0] [ASK-DIAG] llm call return rc=0 http=200
+[CPU0] [ASK-DIAG] response json parse begin
+[CPU0] [ASK-DIAG] response json parse ok
+[CPU0] [llm] Response: 0 bytes text, 1 tool calls, finish=tool_calls
+[CPU0] [MEM-DIAG] phase=LLM_POST internal free=33016 largest=14872 psram free=8314432 largest=8314432 combined free=8347448 largest=8314432
+[CPU0] [ASK-DIAG] llm_done rc=0 http=200
+[CPU0] [agent] LLM resp: text=0, tool_use=1, calls=1
+[CPU0] [agent] Tool iter 1: 1 calls
+[CPU0] [trace:0000002700000000] iter=0 tool=get_current_time latency=7190ms llm=ok backend=0
+[CPU0] [agent] Tool call: get_current_time args={}
+[CPU0] [tools] Executing tool: get_current_time
+[CPU0] [tool_time] Fetching current time...
+[CPU0] [tool_time] Time (local clock): 2026-02-28 18:40:07 CST (UTC+8), UNIX epoch: 1772275207
+[CPU0] [agent] Tool get_current_time result: 55 bytes
+[CPU0] [ASK-DIAG] llm_begin
+[CPU0] [MEM-DIAG] phase=LLM_PRE internal free=31752 largest=14872 psram free=8314432 largest=8314432 combined free=8346184 largest=8314432
+[CPU0] [HEAP-GATE] TOOLS_PARSED PASS
+[CPU0] [llm] OpenAI API with tools (model: mimo-v2.5, 15221 bytes)
+[CPU0] [ASK-DIAG] http send begin bytes=15221
+[CPU0] [vela_tls] Reusing pooled connection to token-plan-cn.xiaomimimo.com:443
+[CPU0] [ASK-DIAG] http send begin bytes=15477
+[CPU0] [TLS-PROBE] send begin bytes=15477
+[CPU0] [ASK-DIAG] http send ret=256 errno=11
+[CPU0] [TLS-PROBE] send ret=256 errno=11
+[CPU0] [ASK-DIAG] http send ret=15221 errno=11
+[CPU0] [TLS-PROBE] send ret=15221 errno=11
+[CPU0] [ASK-DIAG] http recv begin
+[CPU0] [TLS-PROBE] recv begin
+[CPU0] [ASK-DIAG] http recv ret=896 errno=11
+[CPU0] [TLS-PROBE] recv ret=896 errno=11
+[CPU0] [HTTP-DIAG] response complete status=200
+[CPU0] [ASK-DIAG] http header parsed
+[CPU0] [ASK-DIAG] http body bytes=567
+[CPU0] [TLS-PROBE] recv body bytes=567
+[CPU0] [ASK-DIAG] llm call return rc=0 http=200
+[CPU0] [ASK-DIAG] response json parse begin
+[CPU0] [ASK-DIAG] response json parse ok
+[CPU0] [llm] Response: 88 bytes text, 0 tool calls, finish=end_turn
+[CPU0] [MEM-DIAG] phase=LLM_POST internal free=31616 largest=14872 psram free=8314432 largest=8314432 combined free=8346048 largest=8314432
+[CPU0] [ASK-DIAG] llm_done rc=0 http=200
+[CPU0] [agent] LLM resp: text=88, tool_use=0, calls=0
+[CPU0] [trace:0000002700000000] iter=1 tool=(none) latency=2280ms llm=ok backend=0
+[CPU0] [trace:0000002700000000] END status=ok iters=2 tools=1 llm_ms=9470 elapsed=9530ms backend=0
+[CPU0] [ASK-DIAG] outbound
+[CPU0] [BUS-DIAG] consumer waiting
+[CPU0] [BUS-DIAG] consumer bus=0x3fc99008
+[CPU0] [agent] Dispatching response → cli:console
+[CPU0] [agent] [Agent]: 当前时间：**2026年2月28日 18:40:07** (CST, UTC+8)
+
+UNIX 时间戳：`1772275207`
+
+[Agent]: 当前时间：**2026年2月28日 18:40:07** (CST, UTC+8)
+
+UNIX 时间戳：`1772275207`
+vela> ask 一句话阐述惯性定律
+[CPU0] [BUS-DIAG] producer push begin source=cli:console len=27
+[CPU0] [BUS-DIAG] producer bus=0x3fc99008
+[CPU0] [BUS-DIAG] producer push end rc=0
+[CPU0] [agent] ask: 一句话阐述惯性定律
+[CPU0] [BUS-DIAG] consumer pop rc=0 source=cli len=27
+[CPU0] [ASK-DIAG] inbound
+[CPU0] [agent] Processing message from cli:console
+Sent to agent: 一句话阐述惯性定律
+vela> [CPU0] [skills] Skills summary: 814 bytes
+[CPU0] [context] System prompt built: 3289 bytes
+[CPU0] [AI-DOG-DIAG] ask stage=prompt
+[CPU0] [AI-DOG-DIAG] ask stage=tools bytes=9946
+[CPU0] [AI-DOG-DIAG] ask stage=messages
+[CPU0] [AI-DOG-DIAG] ask stage=react
+[CPU0] [llm] LLM config updated atomically: token-plan-cn.xiaomimimo.com/v1/chat/completions (model: mimo-v2.5)
+[CPU0] [trace:0000003e35c3b13a] BEGIN chat=console chan=cli
+[CPU0] [ASK-DIAG] llm_begin
+[CPU0] [MEM-DIAG] phase=LLM_PRE internal free=31640 largest=14872 psram free=8314432 largest=8314432 combined free=8346072 largest=8314432
+[CPU0] [HEAP-GATE] TOOLS_PARSED PASS
+[CPU0] [llm] OpenAI API with tools (model: mimo-v2.5, 15043 bytes)
+[CPU0] [ASK-DIAG] http send begin bytes=15043
+[CPU0] [agent] Dispatching response → cli:console
+[CPU0] [agent] [Agent]: 稍等，处理中...
+
+[Agent]: 稍等，处理中...
+vela> [CPU0] [vela_tls] Reusing pooled connection to token-plan-cn.xiaomimimo.com:443
+[CPU0] [ASK-DIAG] http send begin bytes=15299
+[CPU0] [TLS-PROBE] send begin bytes=15299
+[CPU0] [ASK-DIAG] http send ret=256 errno=11
+[CPU0] [TLS-PROBE] send ret=256 errno=11
+[CPU0] [ASK-DIAG] http send ret=15043 errno=11
+[CPU0] [TLS-PROBE] send ret=15043 errno=11
+[CPU0] [ASK-DIAG] http recv begin
+[CPU0] [TLS-PROBE] recv begin
+[CPU0] [ASK-DIAG] http recv ret=1014 errno=11
+[CPU0] [TLS-PROBE] recv ret=1014 errno=11
+[CPU0] [HTTP-DIAG] response complete status=200
+[CPU0] [ASK-DIAG] http header parsed
+[CPU0] [ASK-DIAG] http body bytes=685
+[CPU0] [TLS-PROBE] recv body bytes=685
+[CPU0] [ASK-DIAG] llm call return rc=0 http=200
+[CPU0] [ASK-DIAG] response json parse begin
+[CPU0] [ASK-DIAG] response json parse ok
+[CPU0] [llm] Response: 121 bytes text, 0 tool calls, finish=end_turn
+[CPU0] [MEM-DIAG] phase=LLM_POST internal free=31416 largest=14872 psram free=8314432 largest=8314432 combined free=8345848 largest=8314432
+[CPU0] [ASK-DIAG] llm_done rc=0 http=200
+[CPU0] [agent] LLM resp: text=121, tool_use=0, calls=0
+[CPU0] [trace:0000003e35c3b13a] iter=0 tool=(none) latency=4150ms llm=ok backend=0
+[CPU0] [trace:0000003e35c3b13a] END status=ok iters=1 tools=0 llm_ms=4150 elapsed=4160ms backend=0
+[CPU0] [ASK-DIAG] outbound
+[CPU0] [BUS-DIAG] consumer waiting
+[CPU0] [BUS-DIAG] consumer bus=0x3fc99008
+[CPU0] [agent] Dispatching response → cli:console
+[CPU0] [agent] [Agent]: 惯性定律（牛顿第一定律）：**物体在不受外力时，将保持静止或匀速直线运动状态不变。**
+
+[Agent]: 惯性定律（牛顿第一定律）：**物体在不受外力时，将保持静止或匀速直线运动状态不变。**

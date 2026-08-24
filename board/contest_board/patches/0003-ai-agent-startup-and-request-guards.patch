@@ -1,0 +1,1359 @@
+diff --git a/packages/ai_agent/include/agent_compat.h b/packages/ai_agent/include/agent_compat.h
+index 7565df8..3a44426 100644
+--- a/packages/ai_agent/include/agent_compat.h
++++ b/packages/ai_agent/include/agent_compat.h
+@@ -50,6 +50,7 @@ typedef struct {
+     void* (*func)(void*);
+     void* arg;
+     int stack_size;
++    const char* name;
+ } _agent_task_args_t;
+ 
+ static inline void* _agent_task_shim(void* p)
+@@ -57,6 +58,18 @@ static inline void* _agent_task_shim(void* p)
+     _agent_task_args_t* ta = (_agent_task_args_t*)p;
+     void* (*f)(void*) = ta->func;
+     void* a = ta->arg;
++    const char* name = ta->name ? ta->name : "agent_task";
++    struct sched_param current_param;
++    int policy = sched_getscheduler(0);
++    int priority = -1;
++    if (sched_getparam(0, &current_param) == 0) {
++        priority = current_param.sched_priority;
++    }
++    syslog(LOG_INFO,
++        "[THREAD-DIAG] name=%s pid=%d entry=0x%" PRIxPTR
++        " stack=%d priority=%d policy=%d cpu=%d\n",
++        name, (int)gettid(), (uintptr_t)f, ta->stack_size,
++        priority, policy, sched_getcpu());
+     free(ta);
+     return f(a);
+ }
+@@ -76,6 +89,7 @@ static inline int agent_task_create(void* (*func)(void*), const char* name,
+     ta->func = func;
+     ta->arg = arg;
+     ta->stack_size = stack_size;
++    ta->name = name;
+ 
+     pthread_attr_t attr;
+     pthread_attr_init(&attr);
+@@ -95,6 +109,7 @@ static inline int agent_task_create(void* (*func)(void*), const char* name,
+         free(ta);
+         return ERROR;
+     }
++    pthread_setname_np(tid, name ? name : "agent_task");
+     pthread_detach(tid);
+     return OK;
+ }
+diff --git a/packages/ai_agent/src/agent_main.c b/packages/ai_agent/src/agent_main.c
+index 9d676c2..bbca41b 100644
+--- a/packages/ai_agent/src/agent_main.c
++++ b/packages/ai_agent/src/agent_main.c
+@@ -96,6 +96,18 @@ pthread_mutex_t g_stdout_lock = PTHREAD_MUTEX_INITIALIZER;
+  * to trigger graceful teardown instead of calling exit(). */
+ static volatile bool g_shutdown_requested = false;
+ 
++enum net_services_state_e
++{
++    NET_SERVICES_STOPPED = 0,
++    NET_SERVICES_STARTING,
++    NET_SERVICES_STARTED,
++};
++
++static pthread_mutex_t g_net_services_lock = PTHREAD_MUTEX_INITIALIZER;
++static enum net_services_state_e g_net_services_state = NET_SERVICES_STOPPED;
++static bool g_core_ready;
++static bool g_cli_ready;
++
+ void agent_request_shutdown(void)
+ {
+     g_shutdown_requested = true;
+@@ -108,35 +120,115 @@ bool agent_shutdown_requested(void)
+ 
+ /* ── Network watcher (async) ──────────────────────────────────── */
+ 
+-#ifdef CONFIG_AI_AGENT_NET_RPMSG
+-static volatile bool g_net_services_started = false;
+-
+-static void net_state_change_cb(net_state_t state, void* arg)
++static int start_network_services_once(void)
+ {
+-    (void)arg;
+-    if (state == NET_STATE_CONNECTED && !g_net_services_started) {
+-        syslog(LOG_INFO, "[%s] Network recovered, starting services\n", TAG);
++    int ret;
++
++    pthread_mutex_lock(&g_net_services_lock);
++    if (!g_core_ready || !g_cli_ready)
++      {
++        syslog(LOG_WARNING,
++            "[AI-DOG-DIAG] net_services deferred core_ready=%d cli_ready=%d\n",
++            g_core_ready, g_cli_ready);
++        pthread_mutex_unlock(&g_net_services_lock);
++        return ERROR;
++      }
++
++    if (g_net_services_state == NET_SERVICES_STARTED)
++      {
++        pthread_mutex_unlock(&g_net_services_lock);
++        return OK;
++      }
++
++    if (g_net_services_state == NET_SERVICES_STARTING)
++      {
++        syslog(LOG_INFO,
++            "[AI-DOG-DIAG] net state STARTING (duplicate event ignored)\n");
++        pthread_mutex_unlock(&g_net_services_lock);
++        return OK;
++      }
++
++    g_net_services_state = NET_SERVICES_STARTING;
++    pthread_mutex_unlock(&g_net_services_lock);
++    syslog(LOG_INFO, "[AI-DOG-DIAG] net state STOPPED->STARTING\n");
++
+ #ifdef CONFIG_AI_AGENT_FEISHU
+-        feishu_bot_start();
++    if (feishu_bot_start() != OK)
++      {
++        syslog(LOG_WARNING, "[%s] feishu_bot_start failed\n", TAG);
++      }
++#endif
++
++#define AI_AGENT_NET_BISECT_N2 1
++#if AI_AGENT_NET_BISECT_N2
++    syslog(LOG_INFO, "[NET-BISECT] ws=SKIPPED\n");
++#else
++    ret = ws_server_start();
++    if (ret != OK)
++      {
++        goto failed;
++      }
++    syslog(LOG_INFO, "[NET-BISECT] ws=ENABLED\n");
++#endif
++
++#if AI_AGENT_NET_BISECT_N2
++    ret = agent_loop_start();
++    if (ret != OK)
++      {
++        goto failed;
++      }
++    syslog(LOG_INFO, "[AGENTLOOP-BISECT] thread created\n");
++    syslog(LOG_INFO, "[NET-BISECT] agent_loop=ENABLED\n");
++#else
++    syslog(LOG_INFO, "[NET-BISECT] agent_loop=SKIPPED\n");
+ #endif
+-        agent_loop_start();
+-        ws_server_start();
++
+ #ifdef CONFIG_AI_AGENT_NODE
+-        node_client_start();
++    if (node_client_start() != OK)
++      {
++        syslog(LOG_WARNING, "[%s] node_client_start failed\n", TAG);
++      }
+ #endif
+ #ifdef CONFIG_AI_AGENT_MQTT
+-        mqtt_channel_start();
++    if (mqtt_channel_start() != OK)
++      {
++        syslog(LOG_WARNING, "[%s] mqtt_channel_start failed\n", TAG);
++      }
+ #endif
+ #ifdef CONFIG_AI_AGENT_WEIXIN
+-        weixin_channel_start();
+-#endif
+-        g_net_services_started = true;
++    if (weixin_channel_start() != OK)
++      {
++        syslog(LOG_WARNING, "[%s] weixin_channel_start failed\n", TAG);
++      }
++#endif
++
++    pthread_mutex_lock(&g_net_services_lock);
++    g_net_services_state = NET_SERVICES_STARTED;
++    pthread_mutex_unlock(&g_net_services_lock);
++    syslog(LOG_INFO, "[AI-DOG-DIAG] net state STARTING->STARTED\n");
++    syslog(LOG_INFO, "[%s] All network services started!\n", TAG);
++    return OK;
++
++failed:
++    pthread_mutex_lock(&g_net_services_lock);
++    g_net_services_state = NET_SERVICES_STOPPED;
++    pthread_mutex_unlock(&g_net_services_lock);
++    syslog(LOG_WARNING,
++        "[AI-DOG-DIAG] net state STARTING->STOPPED rc=%d\n", ret);
++    return ret;
++}
++
++#ifdef CONFIG_AI_AGENT_NET_RPMSG
++static void net_state_change_cb(net_state_t state, void* arg)
++{
++    (void)arg;
++    if (state == NET_STATE_CONNECTED) {
++        syslog(LOG_INFO, "[%s] Network recovered, starting services\n", TAG);
++        start_network_services_once();
+     } else if (state == NET_STATE_DISCONNECTED) {
+         syslog(LOG_WARNING,
+             "[%s] Network lost, services may be affected\n", TAG);
+-        /* Services will handle disconnection via their own error paths.
+-         * We just log the event here. g_net_services_started stays true
+-         * so we don't re-start services that are already running. */
++        /* Services handle disconnection through their own error paths. */
+     }
+ }
+ #endif
+@@ -154,6 +246,7 @@ static void* network_watch_task(void* arg)
+ 
+     if (network_wait_connected(30000) == OK) {
+         syslog(LOG_INFO, "[%s] Network connected: %s\n", TAG, network_get_ip());
++        syslog(LOG_INFO, "[AI-DOG-DIAG] network_connected\n");
+ 
+ #if AGENT_SKILL_SYNC_ENABLED
+         /* Sync skills from Bitable before starting agent loop */
+@@ -162,32 +255,7 @@ static void* network_watch_task(void* arg)
+         }
+ #endif
+ 
+-#ifdef CONFIG_AI_AGENT_FEISHU
+-        if (feishu_bot_start() != OK)
+-            syslog(LOG_WARNING, "[%s] feishu_bot_start failed\n", TAG);
+-#endif
+-        if (agent_loop_start() != OK)
+-            syslog(LOG_WARNING, "[%s] agent_loop_start failed\n", TAG);
+-        if (ws_server_start() != OK)
+-            syslog(LOG_WARNING, "[%s] ws_server_start failed\n", TAG);
+-#ifdef CONFIG_AI_AGENT_NODE
+-        if (node_client_start() != OK)
+-            syslog(LOG_WARNING, "[%s] node_client_start failed\n", TAG);
+-#endif
+-#ifdef CONFIG_AI_AGENT_MQTT
+-        if (mqtt_channel_start() != OK)
+-            syslog(LOG_WARNING, "[%s] mqtt_channel_start failed\n", TAG);
+-#endif
+-#ifdef CONFIG_AI_AGENT_WEIXIN
+-        if (weixin_channel_start() != OK)
+-            syslog(LOG_WARNING, "[%s] weixin_channel_start failed\n", TAG);
+-#endif
+-
+-        syslog(LOG_INFO, "[%s] All network services started!\n", TAG);
+-
+-#ifdef CONFIG_AI_AGENT_NET_RPMSG
+-        g_net_services_started = true;
+-#endif
++        start_network_services_once();
+     } else {
+         syslog(LOG_WARNING, "[%s] Network timeout — net services not started.\n", TAG);
+         syslog(LOG_WARNING, "[%s] Use 'config_show' / 'set_*' CLI commands to configure.\n", TAG);
+@@ -603,6 +671,10 @@ int ai_agent_main(int argc, char* argv[])
+     {
+         int rc = nsh_commands_init();
+         BOOT_LOG_RC(&t0, "P4", "nsh_commands_init", rc);
++        pthread_mutex_lock(&g_net_services_lock);
++        g_core_ready = (rc == OK);
++        pthread_mutex_unlock(&g_net_services_lock);
++        syslog(LOG_INFO, "[AI-DOG-DIAG] core_ready=%d\n", rc == OK);
+     }
+ 
+     /* ── Phase 5: Network — async, does NOT block ready ────── */
+@@ -682,7 +754,21 @@ int ai_agent_main(int argc, char* argv[])
+     }
+ #endif
+ 
+-    /* Network watcher thread: reconnect + wait + start net services */
++    /* ── Phase 6: CLI thread — complete before network services ── */
++    {
++        int rc = nsh_commands_start();
++        BOOT_LOG_RC(&t0, "P6", "nsh_commands_start", rc);
++        if (rc == OK)
++          {
++            rc = nsh_commands_wait_ready(30000);
++            BOOT_LOG_RC(&t0, "P6", "nsh_commands_wait_ready", rc);
++          }
++        pthread_mutex_lock(&g_net_services_lock);
++        g_cli_ready = (rc == OK);
++        pthread_mutex_unlock(&g_net_services_lock);
++    }
++
++    /* Network watcher thread: reconnect + wait + start net services. */
+     if (agent_task_create(network_watch_task, "net_watch",
+             AGENT_OUTBOUND_STACK, NULL,
+             AGENT_OUTBOUND_PRIO)
+@@ -691,12 +777,6 @@ int ai_agent_main(int argc, char* argv[])
+     }
+     BOOT_LOG(&t0, "P5", "network_watch thread started (async)");
+ 
+-    /* ── Phase 6: CLI thread — all services now in known state ── */
+-    {
+-        int rc = nsh_commands_start();
+-        BOOT_LOG_RC(&t0, "P6", "nsh_commands_start", rc);
+-    }
+-
+     syslog(LOG_INFO, "[%s] [boot +%ldms] AI Agent ready. Type 'help' in NSH for commands.\n",
+         TAG, boot_ms(&t0));
+ 
+diff --git a/packages/ai_agent/src/channels/nsh_commands.c b/packages/ai_agent/src/channels/nsh_commands.c
+index 25875b5..d55e269 100644
+--- a/packages/ai_agent/src/channels/nsh_commands.c
++++ b/packages/ai_agent/src/channels/nsh_commands.c
+@@ -25,6 +25,7 @@
+ #include "channels/cmd_llm.h"
+ #include "channels/cmd_voice.h"
+ #include "core/message_bus.h"
++#include "core/agent_loop.h"
+ #include "infra/config_store.h"
+ #include "infra/cron_service.h"
+ #include "infra/heartbeat.h"
+@@ -58,8 +59,10 @@
+ #endif
+ 
+ #include <malloc.h>
++#include <errno.h>
+ #include <pthread.h>
+ #include <stdio.h>
++#include <stdbool.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
+@@ -74,6 +77,10 @@ static const char* TAG = "cli";
+ #define MAX_ARGS 8
+ #define LINE_LEN 256
+ 
++static pthread_mutex_t g_cli_ready_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t g_cli_ready_cond = PTHREAD_COND_INITIALIZER;
++static bool g_cli_ready;
++
+ /* ── Helpers ──────────────────────────────────────────────────── */
+ 
+ static int tokenise(char* line, char** argv, int max_argc)
+@@ -93,6 +100,7 @@ static void cmd_help(void)
+         "Available commands:\n"
+         "  net_status           - Show network connection status\n"
+         "  net_test             - Test HTTPS connection to Baidu\n"
++        "  net_test_http        - Test plain HTTP connection to Baidu\n"
+         "  set_feishu_app <app_id> <app_secret>  - Set Feishu app credentials\n"
+         "  set_feishu_user_token <token>  - Set Feishu user_access_token for doc APIs\n"
+         "  set_llm <preset|host> [model] [key] - Switch LLM backend (kimi/qwen/deepseek/glm/openai)\n"
+@@ -104,6 +112,7 @@ static void cmd_help(void)
+         "  session_clear <id>   - Clear a session\n"
+         "  session_clear_all    - Clear all sessions\n"
+         "  heap_info            - Show memory usage\n"
++        "  heap_hold <bytes>    - Retain one diagnostic heap allocation\n"
+         "  set_proxy <host> <port> - Set HTTP proxy\n"
+         "  clear_proxy          - Remove proxy config\n"
+         "  set_wifi <ssid> <pw> - Connect to WiFi (real hardware; saved for reboot)\n"
+@@ -188,6 +197,24 @@ static void cmd_net_test(void)
+     }
+ }
+ 
++static void cmd_net_test_http(void)
++{
++    char resp[1024];
++    uint32_t seq = vela_http_diag_begin();
++    printf("Testing plain HTTP to www.baidu.com...\n");
++    agent_loop_bisect_http_canary_check("PRE");
++    int status = vela_http_post_json("www.baidu.com", "80", "/", NULL,
++        NULL, resp, sizeof(resp));
++    agent_loop_bisect_http_canary_check("POST");
++    if (status > 0) {
++        printf("SUCCESS! HTTP Status: %d\n", status);
++    } else {
++        printf("FAILED! HTTP Error: 0x%x\n", -status);
++    }
++    syslog(LOG_INFO, "[HTTP-DIAG] command return status=%d\n", status);
++    vela_http_diag_end(seq);
++}
++
+ static void cmd_net_status(void)
+ {
+     printf("Network connected: %s\n", network_is_connected() ? "yes" : "no");
+@@ -312,6 +339,29 @@ static void cmd_heap_info(void)
+         mi.arena, mi.fordblks, mi.uordblks);
+ }
+ 
++static void cmd_heap_hold(int argc, char** argv)
++{
++    char* end = NULL;
++    unsigned long long value;
++
++    if (argc != 2) {
++        printf("Usage: heap_hold <bytes>\n");
++        return;
++    }
++
++    value = strtoull(argv[1], &end, 10);
++    if (end == argv[1] || *end != '\0' || value > SIZE_MAX) {
++        printf("Invalid heap_hold size\n");
++        return;
++    }
++
++    if (agent_loop_bisect_heap_hold((size_t)value) == OK) {
++        printf("heap_hold accepted: %zu bytes\n", (size_t)value);
++    } else {
++        printf("heap_hold failed\n");
++    }
++}
++
+ static void cmd_set_proxy(int argc, char** argv)
+ {
+     if (argc < 3) {
+@@ -888,6 +938,12 @@ static void* cli_thread(void* arg)
+     fflush(stdout);
+     pthread_mutex_unlock(&g_stdout_lock);
+ 
++    pthread_mutex_lock(&g_cli_ready_lock);
++    g_cli_ready = true;
++    pthread_cond_broadcast(&g_cli_ready_cond);
++    pthread_mutex_unlock(&g_cli_ready_lock);
++    syslog(LOG_INFO, "[AI-DOG-DIAG] cli_ready=1\n");
++
+     while (fgets(line, sizeof(line), stdin) != NULL) {
+         /* Strip trailing newline */
+         size_t len = strlen(line);
+@@ -919,6 +975,8 @@ static void* cli_thread(void* arg)
+             cmd_net_status();
+         else if (strcmp(cmd, "net_test") == 0)
+             cmd_net_test();
++        else if (strcmp(cmd, "net_test_http") == 0)
++            cmd_net_test_http();
+         else if (strcmp(cmd, "set_feishu_app") == 0)
+             cmd_set_feishu_app(argc, argv);
+         else if (strcmp(cmd, "set_feishu_user_token") == 0)
+@@ -941,6 +999,8 @@ static void* cli_thread(void* arg)
+             cmd_session_clear_all();
+         else if (strcmp(cmd, "heap_info") == 0)
+             cmd_heap_info();
++        else if (strcmp(cmd, "heap_hold") == 0)
++            cmd_heap_hold(argc, argv);
+         else if (strcmp(cmd, "set_proxy") == 0)
+             cmd_set_proxy(argc, argv);
+         else if (strcmp(cmd, "clear_proxy") == 0)
+@@ -1086,5 +1146,38 @@ int nsh_commands_init(void)
+ 
+ int nsh_commands_start(void)
+ {
+-    return agent_task_create(cli_thread, "agent_cli", AGENT_CLI_STACK, NULL, AGENT_CLI_PRIO);
++    int ret;
++
++    pthread_mutex_lock(&g_cli_ready_lock);
++    g_cli_ready = false;
++    pthread_mutex_unlock(&g_cli_ready_lock);
++
++    ret = agent_task_create(cli_thread, "agent_cli", AGENT_CLI_STACK, NULL,
++                            AGENT_CLI_PRIO);
++    return ret;
++}
++
++int nsh_commands_wait_ready(uint32_t timeout_ms)
++{
++    struct timespec deadline;
++    int ret = OK;
++
++    clock_gettime(CLOCK_REALTIME, &deadline);
++    deadline.tv_sec += timeout_ms / 1000;
++    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
++    if (deadline.tv_nsec >= 1000000000L)
++      {
++        deadline.tv_sec++;
++        deadline.tv_nsec -= 1000000000L;
++      }
++
++    pthread_mutex_lock(&g_cli_ready_lock);
++    while (!g_cli_ready && ret == OK)
++      {
++        ret = pthread_cond_timedwait(&g_cli_ready_cond, &g_cli_ready_lock,
++                                     &deadline);
++      }
++    pthread_mutex_unlock(&g_cli_ready_lock);
++
++    return ret == OK ? OK : -ret;
+ }
+diff --git a/packages/ai_agent/src/channels/nsh_commands.h b/packages/ai_agent/src/channels/nsh_commands.h
+index d3dc74e..12d42ee 100644
+--- a/packages/ai_agent/src/channels/nsh_commands.h
++++ b/packages/ai_agent/src/channels/nsh_commands.h
+@@ -24,6 +24,7 @@
+ 
+ #include "agent_compat.h"
+ #include <pthread.h>
++#include <stdint.h>
+ 
+ /* Shared stdout mutex — prevents concurrent printf from outbound_dispatch_task
+  * and cli_thread which causes adbd shell_service_uv assert. */
+@@ -40,3 +41,6 @@ int nsh_commands_init(void);
+  * Call after all services are in a known state (post Phase 5).
+  */
+ int nsh_commands_start(void);
++
++/* Wait until the CLI thread has installed its prompt and entered its loop. */
++int nsh_commands_wait_ready(uint32_t timeout_ms);
+diff --git a/packages/ai_agent/src/core/agent_loop.c b/packages/ai_agent/src/core/agent_loop.c
+index 3d9dec3..003e7e2 100644
+--- a/packages/ai_agent/src/core/agent_loop.c
++++ b/packages/ai_agent/src/core/agent_loop.c
+@@ -52,6 +52,81 @@ static const char* TAG = "agent";
+ #define TOOL_OUTPUT_SIZE_LARGE (16 * 1024)
+ #define TOOL_OUTPUT_SIZE_MIN (2 * 1024)
+ 
++#define AGENT_LOOP_BISECT_A2E 1
++
++#if AGENT_LOOP_BISECT_A2E
++static pthread_mutex_t s_agent_bisect_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t s_agent_bisect_cond = PTHREAD_COND_INITIALIZER;
++
++#define AGENT_LOOP_DUMMY_REDZONE_BYTES 32
++
++static char* s_dummy_tools_raw;
++static char* s_dummy_tools;
++static size_t s_dummy_tools_size;
++static bool s_dummy_tools_held;
++
++static void agent_loop_bisect_fill_canary(char* ptr)
++{
++    memset(ptr, 0xd3, AGENT_LOOP_DUMMY_REDZONE_BYTES);
++}
++
++static bool agent_loop_bisect_canary_ok(const char* ptr)
++{
++    for (size_t i = 0; i < AGENT_LOOP_DUMMY_REDZONE_BYTES; i++) {
++        if ((unsigned char)ptr[i] != 0xd3) {
++            return false;
++        }
++    }
++    return true;
++}
++
++void agent_loop_bisect_http_canary_check(const char* phase)
++{
++    bool ok = s_dummy_tools_size == 0 ||
++        (s_dummy_tools_raw != NULL && s_dummy_tools != NULL &&
++            agent_loop_bisect_canary_ok(s_dummy_tools_raw) &&
++            agent_loop_bisect_canary_ok(s_dummy_tools + s_dummy_tools_size));
++
++    syslog(LOG_INFO, "[HEAP-DIAG] canary dummy %s ok=%d\n", phase,
++        ok ? 1 : 0);
++}
++
++int agent_loop_bisect_heap_hold(size_t size)
++{
++    agent_mem_status_t before;
++    agent_mem_status_t after;
++
++    if (s_dummy_tools_held) {
++        syslog(LOG_WARNING, "[HEAP-DIAG] dummy already held\n");
++        return ERROR;
++    }
++
++    agent_mem_get_status(&before);
++    syslog(LOG_INFO, "[HEAP-DIAG] heap before=%zu\n", before.free_heap);
++
++    if (size > 0) {
++        s_dummy_tools_raw = malloc(size + 2 * AGENT_LOOP_DUMMY_REDZONE_BYTES);
++        if (!s_dummy_tools_raw) {
++            syslog(LOG_ERR, "[HEAP-DIAG] dummy allocation failed size=%zu\n", size);
++            return ERROR;
++        }
++
++        s_dummy_tools = s_dummy_tools_raw + AGENT_LOOP_DUMMY_REDZONE_BYTES;
++        agent_loop_bisect_fill_canary(s_dummy_tools_raw);
++        memset(s_dummy_tools, 0xa5, size);
++        agent_loop_bisect_fill_canary(s_dummy_tools + size);
++    }
++
++    s_dummy_tools_size = size;
++    s_dummy_tools_held = true;
++    agent_mem_get_status(&after);
++    syslog(LOG_INFO, "[HEAP-DIAG] dummy size=%zu ptr=%p\n", size,
++        (void*)s_dummy_tools);
++    syslog(LOG_INFO, "[HEAP-DIAG] heap after=%zu\n", after.free_heap);
++    return OK;
++}
++#endif
++
+ /* ── Forward declarations ──────────────────────────────────── */
+ 
+ static char* handle_slash_note(const agent_msg_t* msg);
+@@ -1371,11 +1446,30 @@ static cJSON* build_messages(const char* chat_id, const char* content,
+         messages = cJSON_CreateArray();
+     }
+ 
++    if (!messages) {
++        return NULL;
++    }
++
+     cJSON* user_msg = cJSON_CreateObject();
+ 
+-    cJSON_AddStringToObject(user_msg, "role", "user");
+-    cJSON_AddStringToObject(user_msg, "content", content);
+-    cJSON_AddItemToArray(messages, user_msg);
++    if (!user_msg) {
++        cJSON_Delete(messages);
++        return NULL;
++    }
++
++    if (!cJSON_AddStringToObject(user_msg, "role", "user") ||
++        !cJSON_AddStringToObject(user_msg, "content", content)) {
++        cJSON_Delete(user_msg);
++        cJSON_Delete(messages);
++        return NULL;
++    }
++
++    if (!cJSON_AddItemToArray(messages, user_msg)) {
++        cJSON_Delete(user_msg);
++        cJSON_Delete(messages);
++        return NULL;
++    }
++
+     return messages;
+ }
+ 
+@@ -1406,11 +1500,14 @@ static void inject_session_context(char* sys_prompt, size_t size,
+ static void* agent_loop_task(void* arg)
+ {
+     (void)arg;
++
+     agent_mem_status_t mem_st;
+ 
+     agent_mem_get_status(&mem_st);
++#if !AGENT_LOOP_BISECT_A2E
+     syslog(LOG_INFO, "[%s] Agent loop started, free heap: %zu\n",
+         TAG, mem_st.free_heap);
++#endif
+ 
+     size_t ctx_size = agent_mem_safe_size(
+         AGENT_CONTEXT_BUF_SIZE, 4 * 1024);
+@@ -1422,6 +1519,7 @@ static void* agent_loop_task(void* arg)
+     char* sys_prompt = calloc(1, ctx_size);
+     char* history_json = calloc(1, hist_size);
+     char* tool_output = calloc(1, tool_size);
++    char* tools_json = NULL;
+ 
+     if (!sys_prompt || !history_json || !tool_output) {
+         syslog(LOG_ERR, "[%s] Failed to allocate agent buffers\n", TAG);
+@@ -1431,27 +1529,43 @@ static void* agent_loop_task(void* arg)
+         return NULL;
+     }
+ 
++#if !AGENT_LOOP_BISECT_A2E
+     syslog(LOG_INFO, "[%s] Buffers: ctx=%zu hist=%zu tool=%zu\n",
+         TAG, ctx_size, hist_size, tool_size);
++#endif
+ 
+-    /* Initialize memory pool for parallel tool outputs */
++    /* A2e: buffers, pool, then an optional CLI-controlled dummy allocation. */
++    syslog(LOG_INFO, "[HEAP-DIAG] name=ctx ptr=%p size=%zu\n",
++        (void*)sys_prompt, ctx_size);
++    syslog(LOG_INFO, "[HEAP-DIAG] name=hist ptr=%p size=%zu\n",
++        (void*)history_json, hist_size);
++    syslog(LOG_INFO, "[HEAP-DIAG] name=tool ptr=%p size=%zu\n",
++        (void*)tool_output, tool_size);
+     size_t pool_buf_size = agent_mem_safe_size(
+         TOOL_OUTPUT_SIZE_LARGE, TOOL_OUTPUT_SIZE_MIN);
+     if (agent_pool_init(&s_tool_pool, pool_buf_size,
+             AGENT_MAX_TOOL_CALLS)
+         == OK) {
+         s_pool_ready = true;
+-        syslog(LOG_INFO, "[%s] Tool output pool: %d x %zu bytes\n",
+-            TAG, AGENT_MAX_TOOL_CALLS, pool_buf_size);
+     } else {
+         syslog(LOG_WARNING,
+             "[%s] Pool init failed, using heap fallback\n", TAG);
+     }
++    syslog(LOG_INFO, "[HEAP-DIAG] name=pool0 ptr=%p size=%zu\n",
++        (void*)s_tool_pool.buffers[0], pool_buf_size);
++    syslog(LOG_INFO, "[HEAP-DIAG] name=pool1 ptr=%p size=%zu\n",
++        (void*)s_tool_pool.buffers[1], pool_buf_size);
++
++    pthread_mutex_lock(&s_agent_bisect_lock);
++    for (;;) {
++        pthread_cond_wait(&s_agent_bisect_cond, &s_agent_bisect_lock);
++    }
+ 
+-    char* tools_json = tool_registry_get_tools_json();
++#if AGENT_LOOP_BISECT_A2E
++    return NULL;
++#endif
+ 
+-    syslog(LOG_INFO, "[%s] Tools JSON loaded: %d bytes\n",
+-        TAG, tools_json ? (int)strlen(tools_json) : 0);
++    tools_json = tool_registry_get_tools_json();
+ 
+     while (!agent_shutdown_requested()) {
+         agent_msg_t msg;
+@@ -1535,13 +1649,33 @@ static void* agent_loop_task(void* arg)
+         context_build_system_prompt(sys_prompt, ctx_size);
+         inject_session_context(sys_prompt, ctx_size,
+             msg.channel, msg.chat_id);
++        syslog(LOG_INFO, "[AI-DOG-DIAG] ask stage=prompt\n");
+ 
+         /* Refresh tools JSON — Node tools are dynamic */
+         free(tools_json);
+         tools_json = tool_registry_get_tools_json();
++        if (!tools_json) {
++            syslog(LOG_ERR, "[AI-DOG-DIAG] ask tools JSON allocation failed\n");
++            dispatch_response(&msg,
++                strdup("Unable to prepare the tool registry."));
++            free(msg.image_b64);
++            free(msg.content);
++            continue;
++        }
++        syslog(LOG_INFO, "[AI-DOG-DIAG] ask stage=tools bytes=%d\n",
++            (int)strlen(tools_json));
+ 
+         cJSON* messages = build_messages(msg.chat_id, msg.content,
+             history_json, hist_size);
++        if (!messages) {
++            syslog(LOG_ERR, "[AI-DOG-DIAG] ask message JSON allocation failed\n");
++            dispatch_response(&msg,
++                strdup("Unable to prepare the request."));
++            free(msg.image_b64);
++            free(msg.content);
++            continue;
++        }
++        syslog(LOG_INFO, "[AI-DOG-DIAG] ask stage=messages\n");
+ 
+         char* final_text = NULL;
+ 
+@@ -1552,6 +1686,7 @@ static void* agent_loop_task(void* arg)
+         } else {
+             /* ReAct loop */
+             s_llm_path_count++;
++            syslog(LOG_INFO, "[AI-DOG-DIAG] ask stage=react\n");
+             final_text = run_react_loop(sys_prompt, messages,
+                 tools_json, tool_output, tool_size, &msg);
+             cJSON_Delete(messages);
+diff --git a/packages/ai_agent/src/core/agent_loop.h b/packages/ai_agent/src/core/agent_loop.h
+index 49a1af9..38e57a2 100644
+--- a/packages/ai_agent/src/core/agent_loop.h
++++ b/packages/ai_agent/src/core/agent_loop.h
+@@ -30,6 +30,8 @@ extern "C" {
+ 
+ int agent_loop_init(void);
+ int agent_loop_start(void);
++void agent_loop_bisect_http_canary_check(const char *phase);
++int agent_loop_bisect_heap_hold(size_t size);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/packages/ai_agent/src/infra/network_manager.c b/packages/ai_agent/src/infra/network_manager.c
+index 00cc296..fc6289d 100644
+--- a/packages/ai_agent/src/infra/network_manager.c
++++ b/packages/ai_agent/src/infra/network_manager.c
+@@ -801,6 +801,22 @@ static int shell_quote(const char* src, char* buf, size_t buf_size)
+     return 0;
+ }
+ 
++static int run_nsh_command(const char* label, const char* cmd)
++{
++    syslog(LOG_INFO, "[WIFI-DIAG] %s\n", label);
++    int ret = system(cmd);
++
++    if (ret != 0)
++      {
++        syslog(LOG_ERR, "[%s] %s failed: rc=%d errno=%d\n", TAG, label,
++               ret, errno);
++        return ERROR;
++      }
++
++    syslog(LOG_INFO, "[%s] %s OK\n", TAG, label);
++    return OK;
++}
++
+ int network_wifi_connect(const char* iface, const char* ssid,
+     const char* pass)
+ {
+@@ -827,50 +843,54 @@ int network_wifi_connect(const char* iface, const char* ssid,
+     syslog(LOG_INFO, "[%s] Connecting WiFi SSID=%s on %s\n", TAG, ssid, dev);
+ 
+     snprintf(cmd, sizeof(cmd), "ifup %s", dev); /* bring up iface first */
+-    system(cmd);
++    if (run_nsh_command("ifup", cmd) != OK)
++        return ERROR;
+     usleep(500000); /* wait for driver ready */
+ 
+     snprintf(cmd, sizeof(cmd), "wapi mode %s 2", dev); /* MANAGED */
+-    system(cmd);
++    if (run_nsh_command("wapi mode", cmd) != OK)
++        return ERROR;
+ 
+     if (pass && pass[0]) {
+         snprintf(cmd, sizeof(cmd), "wapi psk %s %s 3", dev, q_pass);
+-        system(cmd);
++        if (run_nsh_command("wapi psk", cmd) != OK)
++            return ERROR;
+     }
+ 
+     snprintf(cmd, sizeof(cmd), "wapi essid %s %s 1", dev, q_ssid);
+-    system(cmd);
++    if (run_nsh_command("wapi essid", cmd) != OK)
++        return ERROR;
+     usleep(2000000); /* wait for AP association */
+ 
+-    /* P1: verify WiFi association before requesting DHCP.
+-     * 'wapi status' always exits 0 (it just prints iface state), so
+-     * checking its return code is useless. Instead, parse the output
+-     * for "Not-Associated" which wapi prints when no AP is joined.
+-     * If popen fails we fall through and let network_wait_connected
+-     * handle the timeout. */
++    /* 'wapi show' is diagnostic only.  Its pclose() status may be
++     * unavailable when another wait path reaps the shell (ECHILD=10), so
++     * it must never decide whether WiFi or DHCP succeeded. */
+     {
+-        bool associated = true;
+-        snprintf(cmd, sizeof(cmd), "wapi status %s", dev);
++        snprintf(cmd, sizeof(cmd), "wapi show %s", dev);
+         FILE* fp = popen(cmd, "r");
+         if (fp) {
+             char line[256];
+             while (fgets(line, sizeof(line), fp)) {
+-                if (strstr(line, "Not-Associated")) {
+-                    associated = false;
+-                    break;
+-                }
++                /* Drain diagnostic output without interpreting it. */
+             }
+-            pclose(fp);
+-        }
+-        if (!associated) {
+-            syslog(LOG_ERR,
+-                "[%s] WiFi not associated (no carrier), skipping DHCP\n", TAG);
+-            return ERROR;
++            int show_ret = pclose(fp);
++            if (show_ret != 0) {
++                syslog(LOG_WARNING,
++                    "[WIFI-DIAG] wapi show diagnostic failed rc=%d errno=%d\n",
++                    show_ret, errno);
++            }
++        } else {
++            syslog(LOG_WARNING,
++                "[WIFI-DIAG] wapi show diagnostic failed popen errno=%d\n",
++                errno);
+         }
+     }
+ 
++    syslog(LOG_INFO, "[WIFI-DIAG] dhcp/renew\n");
+     snprintf(cmd, sizeof(cmd), "renew %s", dev); /* DHCP */
+-    system(cmd);
++    if (run_nsh_command("renew", cmd) != OK)
++        syslog(LOG_WARNING,
++            "[WIFI-DIAG] dhcp/renew command failed; continuing IP wait\n");
+ 
+     /* Persist credentials.
+      * P2: always write the PSK slot — even when pass is empty — so that
+@@ -880,9 +900,15 @@ int network_wifi_connect(const char* iface, const char* ssid,
+     agent_config_set(AGENT_CFG_KEY_WIFI_SSID, ssid);
+     agent_config_set(AGENT_CFG_KEY_WIFI_PASS, (pass && pass[0]) ? pass : "");
+ 
++    syslog(LOG_INFO, "[WIFI-DIAG] waiting ip\n");
+     int err = network_wait_connected(15000);
+     if (err == OK)
+-        syslog(LOG_INFO, "[%s] WiFi connected: %s\n", TAG, network_get_ip());
++        {
++            syslog(LOG_INFO, "[WIFI-DIAG] ip=%s\n", network_get_ip());
++            syslog(LOG_INFO, "[WIFI-DIAG] connected=1\n");
++            syslog(LOG_INFO, "[%s] WiFi connected: %s\n", TAG,
++                network_get_ip());
++        }
+     else
+         syslog(LOG_WARNING, "[%s] No IP after 15s — check SSID/password\n", TAG);
+     return err;
+diff --git a/packages/ai_agent/src/infra/vela_tls.c b/packages/ai_agent/src/infra/vela_tls.c
+index 0b36760..c2602c4 100644
+--- a/packages/ai_agent/src/infra/vela_tls.c
++++ b/packages/ai_agent/src/infra/vela_tls.c
+@@ -43,9 +43,43 @@
+ #include "mbedtls/ssl.h"
+ 
+ #include <fcntl.h>
++#include <malloc.h>
+ #include <pthread.h>
+ #include <time.h>
+ 
++static uint32_t s_http_diag_seq;
++static uint32_t s_http_diag_active;
++
++uint32_t vela_http_diag_begin(void)
++{
++    struct mallinfo mi = mallinfo();
++    s_http_diag_active = ++s_http_diag_seq;
++    syslog(LOG_INFO,
++        "[RESOURCE-DIAG] seq=%" PRIu32 " phase=PRE heap_free=%d arena=%d\n",
++        s_http_diag_active, mi.fordblks, mi.arena);
++    return s_http_diag_active;
++}
++
++void vela_http_diag_end(uint32_t seq)
++{
++    struct mallinfo mi = mallinfo();
++    syslog(LOG_INFO,
++        "[RESOURCE-DIAG] seq=%" PRIu32 " phase=POST heap_free=%d arena=%d\n",
++        seq, mi.fordblks, mi.arena);
++    s_http_diag_active = 0;
++}
++
++#define HTTP_RES(fmt, ...) \
++    syslog(LOG_INFO, "[HTTP-RES] seq=%" PRIu32 " " fmt "\n", \
++        s_http_diag_active, ##__VA_ARGS__)
++
++static int http_diag_close(int fd)
++{
++    int rc = close(fd);
++    HTTP_RES("socket fd=%d close rc=%d", fd, rc);
++    return rc;
++}
++
+ static int simple_entropy_func(void* data, unsigned char* output, size_t len)
+ {
+     (void)data;
+@@ -123,6 +157,7 @@ typedef struct {
+ 
+ static void tls_ctx_free(tls_ctx_t* ctx)
+ {
++    syslog(LOG_INFO, "[TLS-PROBE] close fd=%d\n", ctx->net.fd);
+     mbedtls_ssl_close_notify(&ctx->ssl);
+     mbedtls_net_free(&ctx->net);
+     mbedtls_ssl_free(&ctx->ssl);
+@@ -233,29 +268,39 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+ {
+     int ret;
+ 
++    syslog(LOG_INFO, "[TLS-PROBE] begin host=%s port=%s\n", host, port);
++
+     mbedtls_ssl_init(&ctx->ssl);
+     mbedtls_ssl_config_init(&ctx->cfg);
+     mbedtls_net_init(&ctx->net);
+     mbedtls_ctr_drbg_init(&ctx->ctr_drbg);
+ 
+     /* Seed RNG directly with our robust function */
++    syslog(LOG_INFO, "[TLS-PROBE] entropy init\n");
+     const char* pers = "vela_tls";
++    syslog(LOG_INFO, "[TLS-PROBE] ctr_drbg seed begin\n");
+     if ((ret = mbedtls_ctr_drbg_seed(&ctx->ctr_drbg, simple_entropy_func, NULL,
+              (const unsigned char*)pers,
+              strlen(pers)))
+         != 0) {
++        syslog(LOG_INFO, "[TLS-PROBE] ctr_drbg seed ret=%d\n", ret);
+         syslog(LOG_ERR, "[%s] ctr_drbg_seed ret=0x%x\n", TAG, -ret);
+         return VELA_TLS_ERR_HANDSHAKE;
+     }
++    syslog(LOG_INFO, "[TLS-PROBE] ctr_drbg seed ret=0\n");
+ 
+     /* Check system time — crucial for TLS certificate validation. */
+     time_t now = time(NULL);
++    syslog(LOG_INFO, "[TLS-PROBE] time check unix=%ld\n", (long)now);
+     syslog(LOG_DEBUG, "[%s] Handshake start: Host=%s, UNIX=%ld\n", TAG, host, (long)now);
+ 
+     if (now < 1704067200) { /* Jan 1 2024 */
+         syslog(LOG_WARNING, "[%s] Clock too old, forcing to 2026\n", TAG);
+         struct timespec ts = { .tv_sec = 1772275200, .tv_nsec = 0 };
+-        clock_settime(CLOCK_REALTIME, &ts);
++        syslog(LOG_INFO, "[TLS-PROBE] time set begin\n");
++        ret = clock_settime(CLOCK_REALTIME, &ts);
++        syslog(LOG_INFO, "[TLS-PROBE] time set done rc=%d errno=%d\n", ret,
++            ret < 0 ? errno : 0);
+     }
+ 
+     /* TCP connect — use HTTP CONNECT proxy if configured */
+@@ -270,23 +315,38 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+ #endif
+ 
+     if (http_proxy_is_enabled()) {
++        syslog(LOG_INFO, "[TLS-PROBE] dns begin\n");
++        syslog(LOG_INFO, "[TLS-PROBE] socket begin\n");
++        syslog(LOG_INFO, "[TLS-PROBE] tcp connect begin\n");
+         int tunnel_fd = proxy_open_tunnel(host, atoi(port), 30000);
+         if (tunnel_fd < 0) {
++            syslog(LOG_INFO, "[TLS-PROBE] tcp connect ret=%d\n", tunnel_fd);
+             syslog(LOG_ERR, "[%s] proxy tunnel to %s:%s failed\n",
+                 TAG, host, port);
+             return VELA_TLS_ERR_CONNECT;
+         }
+         ctx->net.fd = tunnel_fd;
++        syslog(LOG_INFO, "[TLS-PROBE] dns done\n");
++        syslog(LOG_INFO, "[TLS-PROBE] socket fd=%d\n", ctx->net.fd);
++        syslog(LOG_INFO, "[TLS-PROBE] tcp connect ret=0\n");
+         syslog(LOG_INFO, "[%s] Using proxy tunnel fd=%d for %s:%s\n",
+             TAG, tunnel_fd, host, port);
+     } else {
++        syslog(LOG_INFO, "[TLS-PROBE] dns begin\n");
++        syslog(LOG_INFO, "[TLS-PROBE] socket begin\n");
++        syslog(LOG_INFO, "[TLS-PROBE] tcp connect begin\n");
+         if ((ret = mbedtls_net_connect(&ctx->net, host, port,
+                  MBEDTLS_NET_PROTO_TCP))
+             != 0) {
++            syslog(LOG_INFO, "[TLS-PROBE] dns done\n");
++            syslog(LOG_INFO, "[TLS-PROBE] tcp connect ret=%d\n", ret);
+             syslog(LOG_ERR, "[%s] net_connect %s:%s ret=0x%x\n",
+                 TAG, host, port, -ret);
+             return VELA_TLS_ERR_CONNECT;
+         }
++        syslog(LOG_INFO, "[TLS-PROBE] dns done\n");
++        syslog(LOG_INFO, "[TLS-PROBE] socket fd=%d\n", ctx->net.fd);
++        syslog(LOG_INFO, "[TLS-PROBE] tcp connect ret=0\n");
+     }
+ 
+     /* Force blocking mode and set socket-level read timeout.
+@@ -316,11 +376,13 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+     }
+ 
+     /* SSL config: client, TLS, default ciphersuites */
++    syslog(LOG_INFO, "[TLS-PROBE] ssl config begin\n");
+     if ((ret = mbedtls_ssl_config_defaults(&ctx->cfg,
+              MBEDTLS_SSL_IS_CLIENT,
+              MBEDTLS_SSL_TRANSPORT_STREAM,
+              MBEDTLS_SSL_PRESET_DEFAULT))
+         != 0) {
++        syslog(LOG_INFO, "[TLS-PROBE] ssl config ret=%d\n", ret);
+         syslog(LOG_ERR, "[%s] ssl_config_defaults ret=0x%x\n", TAG, -ret);
+         return VELA_TLS_ERR_HANDSHAKE;
+     }
+@@ -357,22 +419,30 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+      * because select()/poll() inside mbedtls_net_recv_timeout fails on
+      * NuttX/QEMU with MBEDTLS_ERR_NET_POLL_FAILED (-0x0047). */
+ 
++    syslog(LOG_INFO, "[TLS-PROBE] ssl setup begin\n");
+     if ((ret = mbedtls_ssl_setup(&ctx->ssl, &ctx->cfg)) != 0) {
++        syslog(LOG_INFO, "[TLS-PROBE] ssl setup ret=%d\n", ret);
+         syslog(LOG_ERR, "[%s] ssl_setup ret=0x%x\n", TAG, -ret);
+         return VELA_TLS_ERR_HANDSHAKE;
+     }
++    syslog(LOG_INFO, "[TLS-PROBE] ssl setup ret=0\n");
+ 
++    syslog(LOG_INFO, "[TLS-PROBE] set hostname\n");
+     if ((ret = mbedtls_ssl_set_hostname(&ctx->ssl, host)) != 0) {
++        syslog(LOG_INFO, "[TLS-PROBE] set hostname ret=%d\n", ret);
+         syslog(LOG_ERR, "[%s] ssl_set_hostname ret=0x%x\n", TAG, -ret);
+         return VELA_TLS_ERR_HANDSHAKE;
+     }
++    syslog(LOG_INFO, "[TLS-PROBE] set hostname ret=0\n");
+ 
+     /* Use blocking recv — no select()/poll().  The read
+      * timeout is enforced by the SO_RCVTIMEO socket option set above. */
++    syslog(LOG_INFO, "[TLS-PROBE] set bio\n");
+     mbedtls_ssl_set_bio(&ctx->ssl, &ctx->net,
+         mbedtls_net_send, mbedtls_net_recv, NULL);
+ 
+     /* Handshake */
++    syslog(LOG_INFO, "[TLS-PROBE] handshake call begin\n");
+     while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
+         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+ #if defined(MBEDTLS_ERROR_C)
+@@ -386,12 +456,17 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+             if (ret == MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE) {
+                 syslog(LOG_ERR, "[%s] Server sent fatal alert message\n", TAG);
+             }
++            syslog(LOG_INFO, "[TLS-PROBE] handshake ret=%d\n", ret);
+             return VELA_TLS_ERR_HANDSHAKE;
+         }
+     }
+ 
++    syslog(LOG_INFO, "[TLS-PROBE] handshake ret=0\n");
++
+     syslog(LOG_INFO, "[%s] Handshake OK: %s / %s\n", TAG, mbedtls_ssl_get_version(&ctx->ssl),
+         mbedtls_ssl_get_ciphersuite(&ctx->ssl));
++    syslog(LOG_INFO, "[ASK-DIAG] tls handshake ok\n");
++    syslog(LOG_INFO, "[TLS-PROBE] handshake ok\n");
+ 
+     return 0;
+ }
+@@ -440,12 +515,20 @@ static int tls_write_request(tls_ctx_t* ctx,
+     HDR_APPEND("\r\n");
+ #undef HDR_APPEND
+ 
++    syslog(LOG_INFO, "[ASK-DIAG] http send begin bytes=%zu\n",
++        (size_t)pos + body_len);
++    syslog(LOG_INFO, "[TLS-PROBE] send begin bytes=%zu\n",
++        (size_t)pos + body_len);
++
+     /* Write headers */
+     int written = 0;
+     while (written < pos) {
+         ret = mbedtls_ssl_write(&ctx->ssl,
+             (const unsigned char*)(hdr + written),
+             (size_t)(pos - written));
++        syslog(LOG_INFO, "[ASK-DIAG] http send ret=%d errno=%d\n", ret,
++            errno);
++        syslog(LOG_INFO, "[TLS-PROBE] send ret=%d errno=%d\n", ret, errno);
+         if (ret > 0) {
+             written += ret;
+         } else if (ret == 0) {
+@@ -466,6 +549,10 @@ static int tls_write_request(tls_ctx_t* ctx,
+             ret = mbedtls_ssl_write(&ctx->ssl,
+                 (const unsigned char*)(body + bw),
+                 body_len - bw);
++            syslog(LOG_INFO, "[ASK-DIAG] http send ret=%d errno=%d\n", ret,
++                errno);
++            syslog(LOG_INFO, "[TLS-PROBE] send ret=%d errno=%d\n", ret,
++                errno);
+             if (ret > 0) {
+                 bw += (size_t)ret;
+             } else if (ret == 0) {
+@@ -533,11 +620,17 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
+     int eof = 0;
+     int ret;
+ 
++    syslog(LOG_INFO, "[ASK-DIAG] http recv begin\n");
++    syslog(LOG_INFO, "[TLS-PROBE] recv begin\n");
++
+     /* Read until we have the full header (double CRLF) or buffer full */
+     while (!eof && raw_len < TLS_RAW_BUF_SIZE - 1) {
+         ret = mbedtls_ssl_read(&ctx->ssl,
+             (unsigned char*)(raw + raw_len),
+             TLS_RAW_BUF_SIZE - 1 - raw_len);
++        syslog(LOG_INFO, "[ASK-DIAG] http recv ret=%d errno=%d\n", ret,
++            errno);
++        syslog(LOG_INFO, "[TLS-PROBE] recv ret=%d errno=%d\n", ret, errno);
+         if (ret > 0) {
+             raw_len += (size_t)ret;
+             if (memmem(raw, raw_len, "\r\n\r\n", 4))
+@@ -561,6 +654,9 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
+         return VELA_TLS_ERR_READ;
+     }
+ 
++    syslog(LOG_INFO, "[HTTP-DIAG] response complete status=%d\n", http_status);
++    syslog(LOG_INFO, "[ASK-DIAG] http header parsed\n");
++
+     /* Find header/body split */
+     char* body_start = (char*)memmem(raw, raw_len, "\r\n\r\n", 4);
+     if (!body_start) {
+@@ -616,6 +712,10 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
+             ret = mbedtls_ssl_read(&ctx->ssl,
+                 (unsigned char*)(resp_buf + resp_pos),
+                 resp_cap - 1 - resp_pos);
++            syslog(LOG_INFO, "[ASK-DIAG] http recv ret=%d errno=%d\n", ret,
++                errno);
++            syslog(LOG_INFO, "[TLS-PROBE] recv ret=%d errno=%d\n", ret,
++                errno);
+             if (ret > 0) {
+                 resp_pos += (size_t)ret;
+             } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+@@ -638,6 +738,9 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
+     if (out_body_len)
+         *out_body_len = resp_pos;
+ 
++    syslog(LOG_INFO, "[ASK-DIAG] http body bytes=%zu\n", resp_pos);
++    syslog(LOG_INFO, "[TLS-PROBE] recv body bytes=%zu\n", resp_pos);
++
+     return http_status;
+ }
+ 
+@@ -846,21 +949,26 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
+         syslog(LOG_INFO, "http: getaddrinfo %s:%s failed: %d", host, port, gai);
+         return VELA_TLS_ERR_CONNECT;
+     }
++    HTTP_RES("dns alloc");
+ 
+     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+     if (fd < 0) {
+         freeaddrinfo(res);
++        HTTP_RES("dns free");
+         syslog(LOG_INFO, "http: socket() failed: %d", errno);
+         return VELA_TLS_ERR_CONNECT;
+     }
++    HTTP_RES("socket fd=%d open", fd);
+ 
+     if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+         syslog(LOG_INFO, "http: connect %s:%s failed: %d", host, port, errno);
+-        close(fd);
++        http_diag_close(fd);
+         freeaddrinfo(res);
++        HTTP_RES("dns free");
+         return VELA_TLS_ERR_CONNECT;
+     }
+     freeaddrinfo(res);
++    HTTP_RES("dns free");
+ 
+     /* Set read timeout */
+     struct timeval tv = { .tv_sec = AGENT_LLM_SOCKET_TIMEOUT_SEC,
+@@ -875,7 +983,7 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
+ #define HTTP_APPEND(fmt, ...)                                               \
+     pos += snprintf(hdr + pos, (int)sizeof(hdr) - pos, fmt, ##__VA_ARGS__); \
+     if (pos >= (int)sizeof(hdr)) {                                          \
+-        close(fd);                                                          \
++        http_diag_close(fd);                                                \
+         return VELA_TLS_ERR_OVERFLOW;                                       \
+     }
+ 
+@@ -897,12 +1005,12 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
+ 
+     /* Send header + body */
+     if (write(fd, hdr, (size_t)pos) != pos) {
+-        close(fd);
++        http_diag_close(fd);
+         return VELA_TLS_ERR_WRITE;
+     }
+     if (json_body && body_len > 0) {
+         if (write(fd, json_body, body_len) != (ssize_t)body_len) {
+-            close(fd);
++            http_diag_close(fd);
+             return VELA_TLS_ERR_WRITE;
+         }
+     }
+@@ -910,9 +1018,10 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
+     /* Read response */
+     char* raw = (char*)malloc(TLS_RAW_BUF_SIZE);
+     if (!raw) {
+-        close(fd);
++        http_diag_close(fd);
+         return VELA_TLS_ERR_READ;
+     }
++    HTTP_RES("raw alloc size=%d", TLS_RAW_BUF_SIZE);
+     size_t raw_len = 0;
+     int eof = 0;
+ 
+@@ -935,7 +1044,8 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
+     if (sscanf(raw, "HTTP/1.%*d %d", &http_status) != 1) {
+         syslog(LOG_INFO, "http: bad status: %.80s", raw);
+         free(raw);
+-        close(fd);
++        HTTP_RES("raw free");
++        http_diag_close(fd);
+         return VELA_TLS_ERR_READ;
+     }
+ 
+@@ -944,7 +1054,8 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
+     if (!body_start) {
+         resp_buf[0] = '\0';
+         free(raw);
+-        close(fd);
++        HTTP_RES("raw free");
++        http_diag_close(fd);
+         return http_status;
+     }
+     body_start += 4;
+@@ -987,8 +1098,14 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
+         }
+     }
+     resp_buf[resp_pos] = '\0';
++    syslog(LOG_INFO, "[HTTP-DIAG] body cleanup begin\n");
+     free(raw);
+-    close(fd);
++    HTTP_RES("raw free");
++    syslog(LOG_INFO, "[HTTP-DIAG] body cleanup done\n");
++    syslog(LOG_INFO, "[HTTP-DIAG] socket close begin fd=%d\n", fd);
++    int close_ret = http_diag_close(fd);
++    syslog(LOG_INFO, "[HTTP-DIAG] socket close ret=%d errno=%d\n", close_ret,
++        close_ret < 0 ? errno : 0);
+ 
+     /* Chunked decode */
+     if (chunked) {
+@@ -996,5 +1113,6 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
+         resp_buf[resp_pos] = '\0';
+     }
+ 
++    syslog(LOG_INFO, "[HTTP-DIAG] command transport return status=%d\n", http_status);
+     return http_status;
+ }
+diff --git a/packages/ai_agent/src/infra/vela_tls.h b/packages/ai_agent/src/infra/vela_tls.h
+index 8e52bf6..abd8fc6 100644
+--- a/packages/ai_agent/src/infra/vela_tls.h
++++ b/packages/ai_agent/src/infra/vela_tls.h
+@@ -95,6 +95,9 @@ int vela_http_post_json(const char *host, const char *port, const char *path,
+                         const char *json_body,
+                         char *resp_buf, size_t resp_cap);
+ 
++uint32_t vela_http_diag_begin(void);
++void vela_http_diag_end(uint32_t seq);
++
+ /**
+  * Send a HEAD request and extract the value of the "Date:" response header.
+  *
+diff --git a/packages/ai_agent/src/llm/llm_proxy.c b/packages/ai_agent/src/llm/llm_proxy.c
+index 48157cc..4abd6c7 100644
+--- a/packages/ai_agent/src/llm/llm_proxy.c
++++ b/packages/ai_agent/src/llm/llm_proxy.c
+@@ -364,6 +364,9 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
+     int status;
+     int use_tls = (strcmp(llm_port, "443") == 0);
+ 
++    syslog(LOG_INFO, "[ASK-DIAG] http send begin bytes=%zu\n",
++        strlen(post_data));
++
+     if (use_tls) {
+         status = vela_https_post_json(llm_host, llm_port, llm_path, hdrs, post_data,
+             rb->data, raw_cap);
+@@ -635,6 +638,8 @@ int llm_chat(const char* system_prompt, const char* messages_json,
+         rb.len = 0;
+         status = 0;
+         err = llm_http_call(post_data, &rb, &status);
++        syslog(LOG_INFO, "[ASK-DIAG] llm call return rc=%d http=%d\n", err,
++            status);
+ 
+         if (err != OK) {
+             resp_buf_free(&rb);
+@@ -703,9 +708,16 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+     }
+ 
+     cJSON* body = cJSON_CreateObject();
++    if (!body) {
++        syslog(LOG_ERR, "[AI-DOG-DIAG] llm request body allocation failed\n");
++        return ERROR;
++    }
+ 
+-    cJSON_AddStringToObject(body, "model",
+-        model_name_for_api(model, llm_host));
++    if (!cJSON_AddStringToObject(body, "model",
++        model_name_for_api(model, llm_host))) {
++        cJSON_Delete(body);
++        return ERROR;
++    }
+ 
+     if (is_openai_compat_host(llm_host)) {
+         cJSON_AddNumberToObject(body, "max_completion_tokens",
+@@ -719,10 +731,28 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+     cJSON* msgs = cJSON_Duplicate(messages, 1);
+     cJSON* sys_msg = cJSON_CreateObject();
+ 
+-    cJSON_AddStringToObject(sys_msg, "role", "system");
+-    cJSON_AddStringToObject(sys_msg, "content", system_prompt);
+-    cJSON_InsertItemInArray(msgs, 0, sys_msg);
+-    cJSON_AddItemToObject(body, "messages", msgs);
++    if (!msgs || !sys_msg) {
++        syslog(LOG_ERR, "[AI-DOG-DIAG] llm request messages allocation failed\n");
++        cJSON_Delete(msgs);
++        cJSON_Delete(sys_msg);
++        cJSON_Delete(body);
++        return ERROR;
++    }
++
++    if (!cJSON_AddStringToObject(sys_msg, "role", "system") ||
++        !cJSON_AddStringToObject(sys_msg, "content", system_prompt) ||
++        !cJSON_InsertItemInArray(msgs, 0, sys_msg)) {
++        cJSON_Delete(sys_msg);
++        cJSON_Delete(msgs);
++        cJSON_Delete(body);
++        return ERROR;
++    }
++
++    if (!cJSON_AddItemToObject(body, "messages", msgs)) {
++        cJSON_Delete(msgs);
++        cJSON_Delete(body);
++        return ERROR;
++    }
+ 
+     /* Convert tools to OpenAI format */
+     cJSON* tools_arr = build_openai_tools_array(tools_json);
+@@ -758,6 +788,8 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+         rb.len = 0;
+         status = 0;
+         err = llm_http_call(post_data, &rb, &status);
++        syslog(LOG_INFO, "[ASK-DIAG] llm call return rc=%d http=%d\n", err,
++            status);
+ 
+         if (err != OK) {
+             resp_buf_free(&rb);
+@@ -781,6 +813,7 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+         return ERROR;
+     }
+ 
++    syslog(LOG_INFO, "[ASK-DIAG] response json parse begin\n");
+     cJSON* root = cJSON_Parse(rb.data);
+ 
+     resp_buf_free(&rb);
+@@ -788,6 +821,7 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+         syslog(LOG_ERR, "[%s] Failed to parse API JSON\n", TAG);
+         return ERROR;
+     }
++    syslog(LOG_INFO, "[ASK-DIAG] response json parse ok\n");
+ 
+     /* Extract from OpenAI response */
+     cJSON* choices = cJSON_GetObjectItem(root, "choices");
