@@ -1,0 +1,7 @@
+build_date=2026-08-20T14:04:57Z
+build_command=AI_AGENT_B31=1 AI_AGENT_B32=0 AI_AGENT_VARIANT_PATCH=0012-b3.2M1-watchdog-local.patch NUTTX_RAW_EXC=1 board/contest_board/scripts/build_with_hal_backport.sh -j8
+elf=contest2026_295_suanliheidong/artifacts/ai_agent_stabilization/nuttx-b3.2M1-watchdog-local.elf
+bin=contest2026_295_suanliheidong/artifacts/ai_agent_stabilization/nuttx-b3.2M1-watchdog-local.bin
+579ed3cc118ecb9f5f9b0f6a4b0b749920d91fe5ddf324668c1d586cfc4be284  contest2026_295_suanliheidong/artifacts/ai_agent_stabilization/nuttx-b3.2M1-watchdog-local.elf
+0f12e8a328db0cffe4731dd365764dd0109dd5a5350f9014d78ba156bba0f8bc  contest2026_295_suanliheidong/artifacts/ai_agent_stabilization/nuttx-b3.2M1-watchdog-local.bin
+21c45f85e75b1a23e45f9b8d47fc9a9dcc2ffb519e9abc4c79b1d1ab5a2e8f56  contest2026_295_suanliheidong/artifacts/ai_agent_stabilization/0012-b3.2M1-watchdog-local.patch

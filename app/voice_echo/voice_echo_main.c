@@ -27,12 +27,17 @@
 
 #include <arch/board/board.h>
 
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
+#include <voice/voice_channel.h>
+#endif
+
 #define VOICE_INPUT_RATE       16000
 #define VOICE_OUTPUT_RATE      24000
 #define VOICE_SAMPLE_BITS      16
 #define VOICE_SLOT_BITS        16
 #define VOICE_CHANNELS         1
 #define VOICE_ECHO_RECORD_SECONDS 5
+#define VOICE_RECORDMEM_SECONDS 3
 #define VOICE_DMA_BYTES        2048
 #define VOICE_RX_DMA_BYTES     1024
 #define VOICE_RX_WARMUP_CHUNKS 2
@@ -50,6 +55,7 @@ enum voice_mode_e
 {
   VOICE_MODE_ECHO = 0,
   VOICE_MODE_RECORDONLY,
+  VOICE_MODE_RECORDMEM,
   VOICE_MODE_SILENCE,
   VOICE_MODE_TONE,
   VOICE_MODE_RESTONE,
@@ -100,6 +106,14 @@ struct voice_rx_stats_s
   uint64_t boundary_sum;
   unsigned int boundary_count;
   struct voice_rx_boundary_s top[VOICE_RX_BOUNDARY_TOP_COUNT];
+};
+
+struct voice_wav_view_s
+{
+  uint8_t header[44];
+  FAR const uint8_t *pcm;
+  size_t pcm_bytes;
+  size_t total_bytes;
 };
 
 /* 750 Hz at 24 kHz has 32 samples per cycle.  The table is deliberately
@@ -985,6 +999,78 @@ errout:
   return ret;
 }
 
+static void voice_put_le16(uint8_t *dst, uint16_t value)
+{
+  dst[0] = (uint8_t)(value & 0xff);
+  dst[1] = (uint8_t)(value >> 8);
+}
+
+static void voice_put_le32(uint8_t *dst, uint32_t value)
+{
+  dst[0] = (uint8_t)(value & 0xff);
+  dst[1] = (uint8_t)((value >> 8) & 0xff);
+  dst[2] = (uint8_t)((value >> 16) & 0xff);
+  dst[3] = (uint8_t)(value >> 24);
+}
+
+static int voice_prepare_wav(struct voice_wav_view_s *wav,
+                             const int16_t *samples, size_t count)
+{
+  uint32_t data_bytes;
+
+  if (wav == NULL || samples == NULL ||
+      count > (UINT32_MAX - 36) / sizeof(int16_t))
+    {
+      return -EFBIG;
+    }
+
+  data_bytes = (uint32_t)(count * sizeof(int16_t));
+  memset(wav->header, 0, sizeof(wav->header));
+  memcpy(&wav->header[0], "RIFF", 4);
+  voice_put_le32(&wav->header[4], 36 + data_bytes);
+  memcpy(&wav->header[8], "WAVEfmt ", 8);
+  voice_put_le32(&wav->header[16], 16);
+  voice_put_le16(&wav->header[20], 1);
+  voice_put_le16(&wav->header[22], VOICE_CHANNELS);
+  voice_put_le32(&wav->header[24], VOICE_INPUT_RATE);
+  voice_put_le32(&wav->header[28], VOICE_INPUT_RATE * sizeof(int16_t));
+  voice_put_le16(&wav->header[32], sizeof(int16_t));
+  voice_put_le16(&wav->header[34], VOICE_SAMPLE_BITS);
+  memcpy(&wav->header[36], "data", 4);
+  voice_put_le32(&wav->header[40], data_bytes);
+  wav->pcm = (FAR const uint8_t *)samples;
+  wav->pcm_bytes = data_bytes;
+  wav->total_bytes = sizeof(wav->header) + data_bytes;
+
+  return 0;
+}
+
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
+static int voice_request_asr(FAR const uint8_t *pcm, size_t pcm_bytes)
+{
+  char text[512];
+  int ret;
+
+  ret = voice_channel_process_pcm(pcm, pcm_bytes, text, sizeof(text));
+  if (ret < 0)
+    {
+      printf("[VOICE] ASR request failed: %d\n", ret);
+      return ret;
+    }
+
+  printf("[VOICE] ASR result: %s\n", text[0] == '\0' ? "<empty>" : text);
+  return 0;
+}
+#else
+static int voice_request_asr(FAR const uint8_t *pcm, size_t pcm_bytes)
+{
+  (void)pcm;
+  (void)pcm_bytes;
+  printf("[VOICE] ASR unavailable: ai_agent is disabled\n");
+  return -ENOSYS;
+}
+#endif
+
 static uint32_t voice_isqrt(uint64_t value)
 {
   uint64_t bit = UINT64_C(1) << 62;
@@ -1530,6 +1616,10 @@ int main(int argc, char *argv[])
         {
           mode = VOICE_MODE_RECORDONLY;
         }
+      else if (strcmp(argv[1], "recordmem") == 0)
+        {
+          mode = VOICE_MODE_RECORDMEM;
+        }
       else if (strcmp(argv[1], "silence") == 0)
         {
           mode = VOICE_MODE_SILENCE;
@@ -1544,17 +1634,20 @@ int main(int argc, char *argv[])
         }
       else if (strcmp(argv[1], "--once") != 0)
         {
-          printf("Usage: voice_echo [--once|recordonly|silence|tone|restone]\n");
+          printf("Usage: voice_echo [--once|recordonly|recordmem|silence|tone|"
+                 "restone]\n");
           return EXIT_FAILURE;
         }
     }
   else if (argc > 2)
     {
-      printf("Usage: voice_echo [--once|recordonly|silence|tone|restone]\n");
+      printf("Usage: voice_echo [--once|recordonly|recordmem|silence|tone|"
+             "restone]\n");
       return EXIT_FAILURE;
     }
 
-  need_mic = mode == VOICE_MODE_ECHO || mode == VOICE_MODE_RECORDONLY;
+  need_mic = mode == VOICE_MODE_ECHO || mode == VOICE_MODE_RECORDONLY ||
+             mode == VOICE_MODE_RECORDMEM;
   need_speaker = mode == VOICE_MODE_ECHO || mode == VOICE_MODE_SILENCE ||
                  mode == VOICE_MODE_TONE || mode == VOICE_MODE_RESTONE;
 
@@ -1648,6 +1741,11 @@ int main(int argc, char *argv[])
       return ret < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
     }
 
+  if (mode == VOICE_MODE_RECORDMEM)
+    {
+      capacity = VOICE_INPUT_RATE * VOICE_RECORDMEM_SECONDS;
+    }
+
   samples = malloc(capacity * sizeof(*samples));
   if (samples == NULL)
     {
@@ -1655,7 +1753,9 @@ int main(int argc, char *argv[])
       return EXIT_FAILURE;
     }
 
-  printf("Record duration: %d s\n", VOICE_ECHO_RECORD_SECONDS);
+  printf("Record duration: %d s\n",
+         mode == VOICE_MODE_RECORDMEM ? VOICE_RECORDMEM_SECONDS :
+         VOICE_ECHO_RECORD_SECONDS);
 
   {
     int16_t minimum;
@@ -1671,8 +1771,10 @@ int main(int argc, char *argv[])
     uint32_t record_elapsed_ms;
     uint32_t effective_rate;
 
-    voice_oled_show(&oled, "REC", "5 SEC");
+    voice_oled_show(&oled, "REC", mode == VOICE_MODE_RECORDMEM ? "3 SEC" :
+                    "5 SEC");
     printf("voice_echo: recording %d seconds...\n",
+           mode == VOICE_MODE_RECORDMEM ? VOICE_RECORDMEM_SECONDS :
            VOICE_ECHO_RECORD_SECONDS);
     clock_gettime(CLOCK_MONOTONIC, &record_start);
     ret = voice_record(mic, samples, capacity, &count, &minimum, &maximum,
@@ -1699,6 +1801,32 @@ int main(int argc, char *argv[])
           {
             printf("voice_echo: diagnostic mode=recordonly complete\n");
             voice_oled_show(&oled, "DONE", "");
+          }
+        else if (mode == VOICE_MODE_RECORDMEM)
+          {
+            struct voice_wav_view_s wav;
+
+            ret = voice_prepare_wav(&wav, samples, count);
+            if (ret < 0)
+              {
+                printf("[VOICE] error stage=wav_memory code=%d\n", ret);
+                voice_oled_show(&oled, "WAV ERROR", "");
+              }
+            else
+              {
+                printf("[VOICE] wav_memory_ready total=%zu pcm=%zu\n",
+                       wav.total_bytes, wav.pcm_bytes);
+                voice_oled_show(&oled, "ASR", "REQ");
+                ret = voice_request_asr(wav.pcm, wav.pcm_bytes);
+                if (ret < 0)
+                  {
+                    voice_oled_show(&oled, "ASR ERROR", "");
+                  }
+                else
+                  {
+                    voice_oled_show(&oled, "ASR", "DONE");
+                  }
+              }
           }
         else
           {

@@ -1,0 +1,24 @@
+--- a/arch/xtensa/src/common/xtensa_assert.c
++++ b/arch/xtensa/src/common/xtensa_assert.c
+@@ -173,6 +173,21 @@
+ {
+   struct tcb_s *tcb = g_running_task;
+ 
++  /* Capture the exception frame before _assert() replaces it with the
++   * panic-context snapshot. */
++  if (regs != NULL)
++    {
++      _alert("[RAW-EXC] PC=%08lx EXCCAUSE=%08lx EXCVADDR=%08lx "
++             "A0=%08lx A1=%08lx A2=%08lx A3=%08lx\n",
++             (unsigned long)regs[REG_PC],
++             (unsigned long)regs[REG_EXCCAUSE],
++             (unsigned long)regs[REG_EXCVADDR],
++             (unsigned long)regs[REG_A0],
++             (unsigned long)regs[REG_A1],
++             (unsigned long)regs[REG_A2],
++             (unsigned long)regs[REG_A3]);
++    }
++
+   if (tcb != NULL)
+     {
+       tcb->xcp.regs = regs;

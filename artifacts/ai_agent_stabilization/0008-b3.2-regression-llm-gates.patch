@@ -1,0 +1,99 @@
+--- a/src/core/agent_loop.c
++++ b/src/core/agent_loop.c
+@@ -1254,7 +1254,9 @@
+         complexity = llm_router_estimate_complexity(
+             msg->content, strlen(msg->content));
+     }
++    syslog(LOG_INFO, "[LLM-GATE] 1 router_enter\n");
+     int router_idx = llm_router_select(complexity);
++    syslog(LOG_INFO, "[LLM-GATE] 2 backend_selected idx=%d\n", router_idx);
+     if (router_idx >= 0) {
+         llm_router_apply(router_idx);
+     }
+--- a/src/llm/llm_proxy.c
++++ b/src/llm/llm_proxy.c
+@@ -694,6 +694,8 @@
+     const char* tools_json, llm_response_t* resp)
+ {
+     memset(resp, 0, sizeof(*resp));
++
++    syslog(LOG_INFO, "[LLM-GATE] 4 proxy_enter\n");
+     s_diag_last_status = 0;
+     s_diag_last_stage = "router";
+ 
+@@ -708,10 +710,26 @@
+     memcpy(llm_host, s_llm_host, sizeof(llm_host));
+     pthread_mutex_unlock(&s_llm_lock);
+ 
++    size_t model_len = strnlen(model, sizeof(model));
++    size_t key_len = strnlen(api_key, sizeof(api_key));
++    size_t host_len = strnlen(llm_host, sizeof(llm_host));
++    syslog(LOG_INFO,
++        "[LLM-GATE] config_snapshot host_ptr=%p host_len=%zu "
++        "model_ptr=%p model_len=%zu key_ptr=%p key_len=%zu\n",
++        (void*)llm_host, host_len, (void*)model, model_len,
++        (void*)api_key, key_len);
++
++    if (model_len >= sizeof(model) || key_len >= sizeof(api_key)
++        || host_len >= sizeof(llm_host)) {
++        syslog(LOG_ERR, "[LLM-GATE] config snapshot unterminated\n");
++        return ERROR;
++    }
++
+     if (api_key[0] == '\0') {
+         return ERROR;
+     }
+ 
++    syslog(LOG_INFO, "[LLM-GATE] 5 request_build_begin\n");
+     cJSON* body = cJSON_CreateObject();
+     if (!body) {
+         syslog(LOG_ERR, "[AI-DOG-DIAG] llm request body allocation failed\n");
+@@ -773,6 +791,9 @@
+         return ERROR;
+     }
+ 
++    syslog(LOG_INFO, "[LLM-GATE] 6 request_build_done bytes=%zu\n",
++        strlen(post_data));
++
+     syslog(LOG_INFO,
+         "[%s] OpenAI API with tools (model: %s, %d bytes)\n",
+         TAG, model, (int)strlen(post_data));
+@@ -793,6 +814,7 @@
+         rb.len = 0;
+         status = 0;
+         s_diag_last_stage = "send";
++        syslog(LOG_INFO, "[LLM-GATE] 7 transport_enter\n");
+         err = llm_http_call(post_data, &rb, &status);
+         s_diag_last_status = status;
+         syslog(LOG_INFO, "[ASK-DIAG] llm call return rc=%d http=%d\n", err,
+--- a/src/llm/llm_router.c
++++ b/src/llm/llm_router.c
+@@ -518,8 +518,27 @@
+         return -1;
+     }
+ 
++    size_t host_len = strnlen(b.host, sizeof(b.host));
++    size_t path_len = strnlen(b.path, sizeof(b.path));
++    size_t model_len = strnlen(b.model, sizeof(b.model));
++    size_t key_len = strnlen(b.api_key, sizeof(b.api_key));
++    syslog(LOG_INFO,
++        "[LLM-GATE] config source host_ptr=%p host_len=%zu "
++        "path_ptr=%p path_len=%zu model_ptr=%p model_len=%zu "
++        "key_ptr=%p key_len=%zu\n",
++        (void*)b.host, host_len, (void*)b.path, path_len,
++        (void*)b.model, model_len, (void*)b.api_key, key_len);
++    if (host_len >= sizeof(b.host) || path_len >= sizeof(b.path)
++        || model_len >= sizeof(b.model) || key_len >= sizeof(b.api_key)) {
++        syslog(LOG_ERR, "[LLM-GATE] backend config unterminated\n");
++        return -1;
++    }
++
+     /* Atomic update — single lock acquisition in llm_proxy */
+-    llm_set_all(b.host, b.path, b.port, b.api_key, b.model);
++    if (llm_set_all(b.host, b.path, b.port, b.api_key, b.model) != OK) {
++        return -1;
++    }
++    syslog(LOG_INFO, "[LLM-GATE] 3 config_snapshot_ok\n");
+ 
+     return 0;
+ }

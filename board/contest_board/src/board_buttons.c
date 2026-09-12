@@ -6,7 +6,9 @@
 
 #include <nuttx/config.h>
 
-#ifdef CONFIG_ARCH_BUTTONS
+#if defined(CONFIG_ARCH_BUTTONS) && \
+    defined(CONFIG_CONTEST_BOARD_REGISTER_BUTTONS) && \
+    CONFIG_CONTEST_BOARD_REGISTER_BUTTONS
 
 #include <errno.h>
 #include <stdint.h>

@@ -6,10 +6,11 @@
 - Flash 16MB: PASS
 - PSRAM 8MB Octal: CONFIGURED
 - UART0 + NSH: PASS
-- Wi-Fi: DISABLED
+- Wi-Fi: restored from hardware-validated Stage 3A configuration; regression pending
 - Bluetooth: DISABLED
-- LCD/Camera: DISABLED
-- I2S lower-halves: ADAPTED (no codec or audio application)
+- OLED: SSD1306-compatible, 128x64, I2C0 address 0x3C (hardware test pending)
+- I2S: voice loopback application built; hardware test pending
+- PWM/robotctl: restored; servo regression pending
 - `-j8` build: PASS
 - `nuttx.bin`: PASS
 - Hardware boot: PASS
@@ -17,8 +18,9 @@
 
 PSRAM runtime stress test: NOT YET VERIFIED.
 
-Stage 2 retains the minimal NSH boot path and adds board-resource adaptation
-only. It does not add peripheral application behavior.
+Stage 2 retains the minimal NSH boot path and adds board-resource adaptation.
+Stage 3 adds an on-demand OLED status display and raw PCM record-then-playback
+application. It does not start audio, PWM, Wi-Fi, or any actuator at boot.
 
 ## 2. Hardware Parameters
 
@@ -38,18 +40,21 @@ remain functional tests for later stages.
 | Resource | GPIO / controller | Board adaptation |
 | --- | --- | --- |
 | LED | GPIO4 | GPIO output; boot level LOW. LED active polarity is unknown. |
-| Touch Button | GPIO14 | Ordinary GPIO button input. |
+| GPIO14 | NC / unused | Legacy reference push-to-talk pin; current board does not connect it. |
 | Boot Button | GPIO0 | Ordinary GPIO button input after normal boot. Do not hold it during reset: it may enter ROM download mode. |
-| OLED I2C | I2C0, SDA GPIO12, SCL GPIO13 | `/dev/i2c0`; `i2c` tool defaults to 400 kHz. No OLED controller driver is registered. |
+| OLED I2C | SSD1306-compatible 128x64, address 0x3C; SDA GPIO12, SCL GPIO13 | Standard NuttX SSD1306 I2C driver; 400 kHz. Hardware rendering test pending. |
 | Servo PWM | GPIO9, GPIO10, GPIO21, GPIO47, GPIO48 | ESP32-S3 LEDC timer 0 with five channels, registered as `/dev/pwm0`. 50 Hz is the intended runtime frequency; the resource remains disabled until a client starts PWM. |
-| MIC I2S RX | I2S0: BCLK GPIO16, WS GPIO17, DIN GPIO18 | Master RX lower-half initialized. |
+| MIC I2S RX | I2S0: BCLK GPIO16, WS GPIO17, DIN GPIO18 | Master RX uses Philips I2S, two 32-bit slots, 24 valid bits, and the schematic-confirmed LEFT slot (`MIC1 L/R` is pulled LOW by R10). The app receives 16 kHz mono signed 16-bit PCM after contest-local conversion. Raw-word alignment remains hardware-test pending. |
 | Speaker I2S TX | I2S1: WS GPIO38, BCLK GPIO39, DOUT GPIO40 | Master TX lower-half initialized. |
 
-I2S0 is permanently assigned to microphone RX and I2S1 to speaker TX for this
-board configuration. The current ESP32-S3 driver defaults to 16-bit, 44100 Hz
-until a future client configures a stream; those values are temporary driver
-defaults, not hardware-validated microphone or speaker settings. No I2S
-character device is registered, by design.
+I2S0 is permanently assigned to microphone RX and I2S1 to speaker TX. The
+voice profile follows `eda-robot-pro/config.h`: MIC 16 kHz and speaker 24 kHz.
+The application selects mono signed 16-bit PCM.  I2S0 internally receives
+the INMP441 physical two-slot, 32-bit-slot, 24-valid-bit Philips stream and
+converts its fixed LEFT slot to that logical format.  Raw-word alignment is
+still subject to the first hardware diagnostic capture.  The application uses
+the public asynchronous I2S lower-half API directly; no I2S character device
+is registered.
 
 Future non-actuating NSH registration checks:
 
@@ -60,6 +65,31 @@ i2c -h
 
 Do not issue PWM start commands until the servo wiring and safe pulse policy
 are hardware-validated.
+
+## 3.1 Integrated Voice Echo
+
+The voice application is an on-demand NSH builtin with no button dependency.
+`voice_echo` records exactly five seconds from I2S0, then plays the captured
+mono PCM through I2S1 and returns to NSH. The bounded record buffer is 160000
+bytes (`16000 * 5 * sizeof(int16_t)`). Playback uses the existing chunked
+16 kHz to 24 kHz 3:2 conversion without a second complete playback buffer.
+OLED updates are best-effort and never make audio fail.
+
+```text
+nsh> voice_echo
+nsh> voice_echo --once
+```
+
+Both forms have identical fixed five-second semantics. GPIO14 is NC/unused;
+the legacy reference push-to-talk behavior is not used. Audio gain is 1.0
+with no codec or filesystem storage.
+
+## 3.2 Features intentionally out of scope
+
+Bluetooth, ASR, TTS, AI, network audio, and audio codecs remain disabled.
+Wi-Fi tools (`wapi`, `renew`, `ping`) and the complete `robotctl` command set
+are enabled in this integrated build. `voice_echo` never starts PWM or changes
+servo state; run `robotctl off` manually before the first audio test.
 
 ## 4. Environment Preparation
 
@@ -91,9 +121,10 @@ source myenv/bin/activate
 contest2026_295_suanliheidong/board/contest_board/scripts/build_with_hal_backport.sh -j8
 ```
 
-The wrapper verifies the HAL base, temporarily applies the upstream backport,
-builds this board, and reverses the patch on both success and failure. HAL
-must be clean after it exits.
+The wrapper verifies the HAL base, temporarily applies the HAL lock backport
+and the NuttX Xtensa BREAK/BREAK.N handler backport, builds this board, then
+reverses both patches on success, failure, SIGINT, or SIGTERM. Neither
+temporary patch remains applied after it exits.
 
 To retain a build log:
 
@@ -190,18 +221,15 @@ echo hello_openvela
 
 ## 12. Not Implemented Yet
 
-- Wi-Fi disabled
 - Bluetooth disabled
-- LCD disabled
+- Wi-Fi enabled; hardware regression pending
 - Camera disabled
-- OLED controller, framebuffer, graphics, and LVGL
-- Microphone functional capture
-- Speaker functional playback
-- Servo motion
-- Application behavior
+- OLED visible output (hardware test pending)
+- Microphone capture (hardware test pending)
+- Speaker playback (hardware test pending)
+- ASR, TTS, codecs, filesystem recording, and AI
 
-Wi-Fi, Bluetooth, LCD, and Camera remain disabled. No codec, audio player, or
-audio recorder application is enabled.
+No codec, audio player, or filesystem audio recorder application is enabled.
 
 ## 13. Important Special Changes
 

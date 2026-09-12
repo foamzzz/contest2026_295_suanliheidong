@@ -24,7 +24,7 @@ Package:
 |     18 | GPIO10  | `RIGHT_REAR_LEG_PIN`      | 右后腿舵机               | LEDC PWM 输出   | 50Hz 舵机 PWM           |
 |     20 | GPIO12  | `DISPLAY_SDA_PIN`         | OLED SDA            | I2C0 双向       | OLED 数据线，启用内部上拉       |
 |     21 | GPIO13  | `DISPLAY_SCL_PIN`         | OLED SCL            | I2C0 时钟       | OLED 时钟线，400kHz       |
-|     22 | GPIO14  | `TOUCH_BUTTON_GPIO`       | 语音触摸按钮/按键           | GPIO 输入       | 按下开始录音，松开停止录音         |
+|     22 | GPIO14  | `TOUCH_BUTTON_GPIO` (legacy) | NC / unused          | 未连接          | 当前竞赛板不使用；录音由 NSH 命令触发 |
 |     23 | GPIO21  | `LEFT_REAR_LEG_PIN`       | 左后腿舵机               | LEDC PWM 输出   | 50Hz 舵机 PWM           |
 |     24 | GPIO47  | `LEFT_FRONT_LEG_PIN`      | 左前腿舵机               | LEDC PWM 输出   | 50Hz 舵机 PWM           |
 |     25 | GPIO48  | `TAIL_SERVO_PIN`          | 尾巴舵机                | LEDC PWM 输出   | 执行摇尾动作                |
@@ -33,3 +33,5 @@ Package:
 |     32 | GPIO39  | `AUDIO_I2S_SPK_GPIO_BCLK` | 扬声器/功放 BCLK         | I2S 输出        | 输出音频位时钟               |
 |     33 | GPIO40  | `AUDIO_I2S_SPK_GPIO_DOUT` | 扬声器/功放数据            | I2S 输出        | ESP32-S3 输出数字音频数据     |
 
+旧参考程序曾将 GPIO14 用作 push-to-talk。当前竞赛板没有连接该引脚，
+`voice_echo` 由 NSH 命令触发，不依赖 GPIO14、GPIO0 或 `/dev/buttons`。

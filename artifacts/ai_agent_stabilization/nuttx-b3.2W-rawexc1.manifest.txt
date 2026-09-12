@@ -1,0 +1,12 @@
+artifact: nuttx-b3.2W-rawexc1
+build_timestamp: 2026-08-20 16:27:01 +0800
+build_command: AI_AGENT_B31=1 AI_AGENT_B32=0 AI_AGENT_VARIANT_PATCH=0010-b3.2W-wlan-only.patch NUTTX_RAW_EXC=1 contest2026_295_suanliheidong/board/contest_board/scripts/build_with_hal_backport.sh -j8
+base: B3.1
+variant: B3.2-W wlan-only
+raw_exception_patch: 0011-nuttx-xtensa-raw-exception-frame.patch
+monotonic_refactor: excluded
+psram_placement: unchanged from B3.1/B2
+websocket: SKIPPED
+elf_sha256: 4d8a701f2adcdf67e6863e1b0a53b10df278f109797af2be6808aac60c1536ae
+bin_sha256: ecb028713974d865493fcb273026110dc96d5a3cca0303d743ab9e3c080e445f
+patch_sha256: 6d9e360e5e1209eefe2694e473dda9ec524067f8d380f402199acebc5df8af91

@@ -1,0 +1,3 @@
+18af7793eae483266a0460a5d0520d0fb81c8f068086b5393983e113840ea06b  contest2026_295_suanliheidong/artifacts/ai_agent_stabilization/nuttx-b3.1-tools-heap-gate-v2.elf
+33572891122ff35fc53961c36ec94d5e5d2cfa56d4e75f26c77a2db6164a89fa  contest2026_295_suanliheidong/artifacts/ai_agent_stabilization/nuttx-b3.1-tools-heap-gate-v2.bin
+9fe7ca7640b8de3b4f5ea9eb07efe8e72b678719d051e3867855bc3036ceede2  contest2026_295_suanliheidong/board/contest_board/patches/0014-ai-agent-tools-heap-gate-v2.patch

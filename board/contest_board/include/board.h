@@ -68,6 +68,15 @@
 #define AUDIO_I2S_MIC_GPIO_WS        17
 #define AUDIO_I2S_MIC_GPIO_DIN       18
 
+/* MIC1 L/R is pulled to GND through R10.  The INMP441 therefore drives the
+ * standard I2S left slot only.
+ */
+
+#define CONTEST_INMP441_LR_LOW       1
+#define CONTEST_INMP441_RX_SLOT_MASK 0x01
+#define CONTEST_INMP441_SLOT_BITS    32
+#define CONTEST_INMP441_VALID_BITS   24
+
 #define AUDIO_I2S_SPK_GPIO_LRCK      38
 #define AUDIO_I2S_SPK_GPIO_BCLK      39
 #define AUDIO_I2S_SPK_GPIO_DOUT      40
@@ -75,6 +84,22 @@
 #define CONTEST_BOARD_BUTTON_TOUCH   0
 #define CONTEST_BOARD_BUTTON_BOOT    1
 #define CONTEST_BOARD_NBUTTONS       2
+
+#ifndef __ASSEMBLY__
+#  include <stdbool.h>
+
+struct i2s_dev_s;
+struct lcd_dev_s;
+
+/* Board-owned peripheral accessors for contest applications. */
+
+struct i2s_dev_s *board_voice_mic_i2s(void);
+struct i2s_dev_s *board_voice_speaker_i2s(void);
+void board_voice_mic_set_diagnostics(bool enabled);
+int board_oled_initialize(void);
+struct lcd_dev_s *board_oled_getdev(void);
+
+#endif
 
 #ifdef CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ
 #  define BOARD_CLOCK_FREQUENCY \

@@ -10,9 +10,20 @@
       "tool": "codex",
       "started_at": "2026-08-08T11:19:14.739Z",
       "last_event_at": "2026-08-08T17:15:19.881Z",
-      "event_count": 634,
-      "raw_event_count": 1730,
+      "event_count": 889,
+      "raw_event_count": 2580,
       "file_path": "logs/foamzzz/2026-08-08/codex__019fe116-ca59-7841-a4a0-0f954a738fdd.jsonl",
+      "collection_mode": "cli",
+      "health": "ok"
+    },
+    {
+      "session_id": "019fe9f4-0cc1-7022-ac65-6d3a95946af1",
+      "tool": "codex",
+      "started_at": "2026-08-10T04:36:51.018Z",
+      "last_event_at": "2026-08-10T05:47:53.227Z",
+      "event_count": 180,
+      "raw_event_count": 672,
+      "file_path": "logs/foamzzz/2026-08-10/codex__019fe9f4-0cc1-7022-ac65-6d3a95946af1.jsonl",
       "collection_mode": "cli",
       "health": "ok"
     }
