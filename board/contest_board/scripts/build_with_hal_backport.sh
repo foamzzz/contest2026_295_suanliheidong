@@ -31,7 +31,7 @@ readonly VOICE_MIMO_SRC="${OPENVELA_ROOT}/packages/ai_agent/src/voice/mimo_voice
 # its generated context and HAL checkout, but it must not replace local source
 # files before the actual make.  Override this list when the project layout
 # uses different source roots.
-readonly LOCAL_SOURCE_PATHS="${LOCAL_SOURCE_PATHS:-packages/ai_agent board/contest_board/src}"
+readonly LOCAL_SOURCE_PATHS="${LOCAL_SOURCE_PATHS:-packages/ai_agent contest2026_295_suanliheidong/app contest2026_295_suanliheidong/board/contest_board/src}"
 readonly LOCAL_SOURCE_SNAPSHOT="${TMPDIR:-/tmp}/openvela-local-source-${BASHPID}"
 
 cd "${OPENVELA_ROOT}"
@@ -144,6 +144,23 @@ bootstrap_hal_checkout()
 
 refresh_demo_kconfig()
 {
+  local robot_agentctl_link="${OPENVELA_ROOT}/packages/demos/contest2026_295_robot_agentctl"
+
+  # Keep the contest-local diagnostic app visible to mkkconfig in worktrees
+  # that have not run repo sync after the manifest entry was added.
+  if test ! -e "${robot_agentctl_link}"; then
+    ln -s ../../contest2026_295_suanliheidong/app/robot_agentctl \
+      "${robot_agentctl_link}"
+  elif test -L "${robot_agentctl_link}" &&
+       test "$(readlink "${robot_agentctl_link}")" != \
+            "../../contest2026_295_suanliheidong/app/robot_agentctl"; then
+    echo "Unexpected robot_agentctl link target; refusing to replace it." >&2
+    exit 1
+  elif test ! -d "${robot_agentctl_link}"; then
+    echo "Unexpected robot_agentctl path; refusing to replace it." >&2
+    exit 1
+  fi
+
   (
     cd "${OPENVELA_ROOT}/packages/demos"
     "${OPENVELA_ROOT}/apps/tools/mkkconfig.sh" -m Demos -o Kconfig
@@ -158,6 +175,19 @@ prepare_build_context()
   # submodule.  Run it before applying the temporary ai_agent compatibility
   # patch so the patch survives the actual compilation.
   "${BUILD_SH}" "${CONFIG_PATH}" context
+}
+
+refresh_restored_build_context()
+{
+  # build.sh context may prepare/copy board/application context before the
+  # contest-local source snapshot is restored.  Existing source files still
+  # compile after restore, but a newly-added source file can be missing from
+  # the generated application source list.  Re-run the NuttX context target
+  # after restore so the active contest CMakeLists.txt/Kconfig are evaluated
+  # again without invoking build.sh's copy/configure phase a second time.
+  echo "Refreshing build context from restored contest-local sources..."
+  run_configured_make context
+  echo "Restored-source build context refreshed."
 }
 
 run_configured_make()
@@ -295,6 +325,13 @@ force_clean_rebuild()
     -name 'vela_tls.c.*.o' \
     -print -delete 2>/dev/null || true
 
+  # robot_voice is also built from outside nuttx/.  Clear stale externally
+  # generated objects so newly-added contest-local sources cannot be hidden by
+  # an old application object/archive list.
+  find "${OPENVELA_ROOT}/contest2026_295_suanliheidong/app/robot_voice" \
+    -maxdepth 1 -type f -name '*.c.*.o' \
+    -print -delete 2>/dev/null || true
+
   rm -f \
     "${OPENVELA_ROOT}/apps/libapps.a" \
     "${NUTTX_DIR}/staging/libapps.a"
@@ -315,6 +352,13 @@ verify_built_voice_image()
 
   if test ! -f "${elf}"; then
     echo "Post-build verification failed: missing ${elf}" >&2
+    exit 1
+  fi
+
+  if grep -Eq '^CONFIG_LVX_USE_DEMO_CONTEST2026_295_ROBOT_AGENTCTL=y$' \
+      "${NUTTX_DIR}/.config" && \
+      ! grep -aF 'robot_agentctl_main' "${elf}" >/dev/null; then
+    echo "Post-build verification failed: ELF missing robot_agentctl marker" >&2
     exit 1
   fi
 
@@ -437,6 +481,12 @@ trap restore_backports EXIT INT TERM
 
 prepare_build_context
 restore_local_sources
+
+# The first build.sh context is required to create the normal ESP32-S3 build
+# environment, but it may have generated the robot_voice source list before
+# the user's contest-local files were restored.  Refresh context now so new
+# files such as robot_music_player.c are part of apps_robot_voice/libapps.a.
+refresh_restored_build_context
 
 patch_state="$("${HAL_PATCH_TOOL}" apply)"
 echo "HAL backport: ${patch_state}"

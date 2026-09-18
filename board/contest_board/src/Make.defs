@@ -12,6 +12,14 @@ ifeq ($(CONFIG_ESP32S3_I2S),y)
 CSRCS += board_voice_i2s.c
 endif
 
+ifeq ($(CONFIG_CONTEST_BOARD_I2S1_TX),y)
+ifeq ($(CONFIG_DRIVERS_AUDIO),y)
+ifeq ($(CONFIG_AUDIO_I2S),y)
+CSRCS += board_voice_audio.c
+endif
+endif
+endif
+
 ifneq ($(filter y,$(CONFIG_CONTEST_BOARD_I2S0_RX) $(CONFIG_CONTEST_BOARD_I2S1_TX)),)
 CSRCS += contest_i2s.c
 endif
@@ -41,4 +49,13 @@ CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)arch$(DELIM)$(CONFIG_ARCH)$(DELIM)src
 CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)arch$(DELIM)$(CONFIG_ARCH)$(DELIM)src$(DELIM)chip$(DELIM)esp-hal-3rdparty$(DELIM)components$(DELIM)soc$(DELIM)esp32s3$(DELIM)include
 CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)arch$(DELIM)$(CONFIG_ARCH)$(DELIM)src$(DELIM)chip$(DELIM)esp-hal-3rdparty$(DELIM)components$(DELIM)soc$(DELIM)include
 CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)arch$(DELIM)$(CONFIG_ARCH)$(DELIM)src$(DELIM)chip$(DELIM)esp-hal-3rdparty$(DELIM)components$(DELIM)esp_common$(DELIM)include
+endif
+
+ifeq ($(CONFIG_ETC_ROMFS),y)
+RCSRCS += etc/init.d/rc.sysinit etc/init.d/rcS
+endif
+
+ifeq ($(CONFIG_MEDIA_SERVER),y)
+RCSRCS += etc/media/graph.conf
+RCRAWS += etc/media/criteria.txt etc/media/settings.pfw etc/media/test.wav
 endif

@@ -55,6 +55,14 @@
 #include "contest_board.h"
 
 /****************************************************************************
+ * Diagnostic Configuration
+ ****************************************************************************/
+
+/* Build F restores contest I2S/GDMA and PCM audio-device registration. */
+
+#define CONTEST_DIAG_DISABLE_AUDIO_BRINGUP 0
+
+/****************************************************************************
  * Public Functions
  ****************************************************************************/
 
@@ -195,7 +203,7 @@ int contest_board_bringup(void)
     }
 #endif
 
-#ifdef CONFIG_ESP32S3_I2S0
+#if !CONTEST_DIAG_DISABLE_AUDIO_BRINGUP && defined(CONFIG_ESP32S3_I2S0)
 #  ifdef CONFIG_CONTEST_BOARD_I2S0_RX
   if (contest_i2s_initialize(ESP32S3_I2S0) == NULL)
 #  else
@@ -206,7 +214,7 @@ int contest_board_bringup(void)
     }
 #endif
 
-#ifdef CONFIG_ESP32S3_I2S1
+#if !CONTEST_DIAG_DISABLE_AUDIO_BRINGUP && defined(CONFIG_ESP32S3_I2S1)
 #  ifdef CONFIG_CONTEST_BOARD_I2S1_TX
   if (contest_i2s_initialize(ESP32S3_I2S1) == NULL)
 #  else
@@ -214,6 +222,16 @@ int contest_board_bringup(void)
 #  endif
     {
       return -ENODEV;
+    }
+#endif
+
+#if !CONTEST_DIAG_DISABLE_AUDIO_BRINGUP && \
+    defined(CONFIG_CONTEST_BOARD_I2S1_TX) && \
+    defined(CONFIG_DRIVERS_AUDIO) && defined(CONFIG_AUDIO_I2S)
+  ret = board_voice_audio_initialize();
+  if (ret < 0)
+    {
+      return ret;
     }
 #endif
 

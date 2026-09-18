@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <nuttx/audio/audio.h>
 #include <nuttx/audio/i2s.h>
@@ -62,6 +63,16 @@
 #define RV_MAX_INFLIGHT              RV_LOWER_DMA_RING_SLOTS
 #define RV_SEND_TIMEOUT_MS           1000
 
+/* F7J transient producer-gap grace.
+ *
+ * One 1024-byte PCM16 source block is ~21.3 ms.  With ten immutable DMA
+ * slots, once a slot is released there is far more than 15 ms before that
+ * same physical slot is needed again.  Use part of that safety window to
+ * wait for late Media PCM instead of inserting an audible silent block.
+ */
+#define RV_UNDERRUN_GRACE_US          100000
+#define RV_UNDERRUN_POLL_US            2000
+
 /*
  * Diagnostic switches.  Keep both at zero for normal TTS playback.
  *
@@ -86,10 +97,15 @@
  *
  *   Ring Buffer     = 256 KiB
  *   Start Prebuffer =  64 KiB
- *   Rebuffer        =  48 KiB
+ *   Rebuffer        =  48 KiB (legacy threshold; F7I does not rebuffer once PLAYING)
  *
  * The playback worker is created at open time and waits in PREBUFFER while
- * the TTS decoder acts only as a PCM producer.
+ * the PCM producer fills the ring.
+ *
+ * F7K invariant for the immutable contest I2S DMA ring:
+ * once PLAYING has started, the worker must keep every released DMA slot
+ * refreshed.  If the producer temporarily runs dry, submit silence instead
+ * of entering REBUFFER and leaving old slot payloads circulating in hardware.
  */
 #if RV_FULL_CACHE_AB_TEST
 #  define RV_RING_BYTES             (2 * 1024 * 1024)
@@ -158,6 +174,8 @@ struct rv_playback_s
 
   volatile int stopped;
   int eos;
+  int stop_on_short_underrun;
+  int terminal_tail_done;
   int eos_silence_rounds;
   enum rv_play_state_e state;
   uint32_t underrun_count;
@@ -174,6 +192,9 @@ struct rv_playback_s
 };
 
 static struct rv_playback_s g_pb;
+static int g_stop_on_short_underrun;
+
+static void rv_signal_all(struct rv_playback_s *pb);
 
 static int rv_lock(struct rv_playback_s *pb)
 {
@@ -486,9 +507,12 @@ static int rv_queue_slot(struct rv_playback_s *pb,
     }
 
   /*
-   * contest_i2s.c requires every submitted APB to be exactly 2048 bytes.
-   * Short EOS source tails are therefore zero-padded below to the full wire
-   * slot size; the lower half never receives a short descriptor.
+   * Normal blocks keep the proven 2048-byte wire contract.
+   *
+   * F7P exception: Media may submit one terminal short tail.  Its APB nbytes
+   * is the exact converted wire length (for example 512 source bytes become
+   * 1024 wire bytes).  contest_i2s shortens that descriptor and terminates
+   * the cyclic ring after the real final samples.
    */
   if (RV_WIRE_BLOCK_BYTES != RV_LOWER_DMA_SLOT_BYTES)
     {
@@ -523,10 +547,13 @@ static int rv_queue_slot(struct rv_playback_s *pb,
   apb = slot->apb;
 
   /*
-   * Keep every physical DMA block exactly 2048 bytes.
-   * Short EOS tails are zero-padded, so descriptor length never changes.
+   * Legacy/TTS short blocks still use zero padding.  Media terminal tails
+   * do not pad beyond tx_len: the lower-half descriptor itself is shortened.
    */
-  memset(apb->samp, 0, RV_WIRE_BLOCK_BYTES);
+  if (tx_len < RV_WIRE_BLOCK_BYTES && !pb->stop_on_short_underrun)
+    {
+      memset(apb->samp, 0, RV_WIRE_BLOCK_BYTES);
+    }
 
   dst = apb->samp;
   for (i = 0; i < frames; i++)
@@ -578,10 +605,20 @@ static int rv_queue_slot(struct rv_playback_s *pb,
 
 
   apb->curbyte = 0;
-  apb->nbytes = RV_WIRE_BLOCK_BYTES;
-  apb->nsamples =
-    RV_WIRE_BLOCK_BYTES /
-    RV_WIRE_BYTES_PER_SAMPLE;
+  if (pb->stop_on_short_underrun && tx_len < RV_WIRE_BLOCK_BYTES)
+    {
+      apb->nbytes = tx_len;
+      apb->nsamples = frames;
+      printf("[RV-PB] terminal tail source=%zu wire=%zu samples=%zu\n",
+             len, tx_len, frames);
+    }
+  else
+    {
+      apb->nbytes = RV_WIRE_BLOCK_BYTES;
+      apb->nsamples =
+        RV_WIRE_BLOCK_BYTES /
+        RV_WIRE_BYTES_PER_SAMPLE;
+    }
 
   ret = rv_lock(pb);
   if (ret < 0)
@@ -701,6 +738,38 @@ static int rv_wait_buffer(struct rv_playback_s *pb, size_t threshold)
     }
 }
 
+static size_t rv_wait_transient_gap(struct rv_playback_s *pb,
+                                    size_t initial_available)
+{
+  size_t available = initial_available;
+  unsigned int waited = 0;
+
+  while (!pb->eos && !pb->stopped &&
+         available < RV_SOURCE_BLOCK_BYTES &&
+         waited < RV_UNDERRUN_GRACE_US)
+    {
+      int result = rv_get_result(pb);
+
+      if (result < 0)
+        {
+          break;
+        }
+
+      usleep(RV_UNDERRUN_POLL_US);
+      waited += RV_UNDERRUN_POLL_US;
+      available = rv_ring_count(pb);
+    }
+
+  if (waited > 0 &&
+      available >= RV_SOURCE_BLOCK_BYTES)
+    {
+      printf("[RV-PB] transient gap recovered wait_us=%u buffered=%zu\n",
+             waited, available);
+    }
+
+  return available;
+}
+
 static void *rv_worker(void *arg)
 {
   struct rv_playback_s *pb = arg;
@@ -708,19 +777,23 @@ static void *rv_worker(void *arg)
   unsigned int slot_index = 0;
   int primed_slots = 0;
   int ret = 0;
+  bool terminal_tail = false;
 
   printf("[RV-PB] worker start source_rate=%u wire_rate=%u "
          "source=mono16 wire=mono-left32 gain_q16=%u resample=none "
-         "source_block=%u wire_block=%u slots=%u priority=%u\n",
+         "source_block=%u wire_block=%u slots=%u priority=%u "
+         "underrun_policy=grace-then-silence grace_us=%u\n",
          RV_TTS_SAMPLE_RATE, RV_WIRE_SAMPLE_RATE, RV_OUTPUT_GAIN_Q16,
          RV_SOURCE_BLOCK_BYTES, RV_WIRE_BLOCK_BYTES,
-         RV_MAX_INFLIGHT, RV_WORKER_PRIORITY);
+         RV_MAX_INFLIGHT, RV_WORKER_PRIORITY, RV_UNDERRUN_GRACE_US);
 
   pb->state = RV_STATE_PREBUFFER;
 
   while (!pb->stopped)
     {
       struct rv_slot_s *slot;
+
+      terminal_tail = false;
       size_t available;
       size_t want;
       size_t got;
@@ -807,6 +880,14 @@ static void *rv_worker(void *arg)
 
       available = rv_ring_count(pb);
 
+      /* F7K: tolerate short Media scheduling jitter before falling back to
+       * the silence-fill underrun policy.  EOS bypasses this wait so finish()
+       * cannot be delayed by the grace window. */
+      if (!pb->eos && available < RV_SOURCE_BLOCK_BYTES)
+        {
+          available = rv_wait_transient_gap(pb, available);
+        }
+
       if (available >= RV_SOURCE_BLOCK_BYTES)
         {
           want = RV_SOURCE_BLOCK_BYTES;
@@ -820,43 +901,117 @@ static void *rv_worker(void *arg)
               continue;
             }
         }
-else if (pb->eos && available == 0)
-  {
-    if (pb->eos_silence_rounds < RV_MAX_INFLIGHT)
-      {
-        memset(block, 0, sizeof(block));
-        want = RV_SOURCE_BLOCK_BYTES;
-        prime_silence = true;
-        pb->eos_silence_rounds++;
-        printf("[RV-PB] EOS silence fill slot=%u round=%d/%u\n",
-               slot_index, pb->eos_silence_rounds, RV_MAX_INFLIGHT);
-      }
-    else
-      {
-        pb->eos_silence_rounds = 0;
-        pb->state = RV_STATE_DRAINING;
-        break;
-      }
-  }
+      else if (pb->eos && available == 0)
+        {
+          if (pb->eos_silence_rounds < RV_MAX_INFLIGHT)
+            {
+              memset(block, 0, sizeof(block));
+              want = RV_SOURCE_BLOCK_BYTES;
+              prime_silence = true;
+              pb->eos_silence_rounds++;
+              printf("[RV-PB] EOS silence fill slot=%u round=%d/%u\n",
+                     slot_index, pb->eos_silence_rounds, RV_MAX_INFLIGHT);
+            }
+          else
+            {
+              printf("[RV-PB] EOS DMA slots sanitized -> DRAINING\n");
+              pb->eos_silence_rounds = 0;
+              pb->state = RV_STATE_DRAINING;
+              break;
+            }
+        }
 
       else
         {
-          if (rv_get_inflight(pb) > 0)
+          /*
+           * F7I: NEVER stop feeding the immutable cyclic DMA ring after
+           * PLAYING has started.
+           *
+           * The lower half keeps its 10 frozen descriptors circulating even
+           * when the upper layer has no logical requests in flight.  The old
+           * REBUFFER path stopped submitting new payloads while waiting for
+           * 48 KiB of producer data; hardware then replayed the stale tail
+           * still stored in those DMA slots ("...变化量量量量...").
+           *
+           * Keep cadence tied to rv_wait_slot()/DMA completion instead:
+           *   - if a short aligned tail exists, play it and let
+           *     rv_queue_slot() zero-pad the rest of the 2048-byte wire slot;
+           *   - if no complete PCM16 sample exists, submit one full silent
+           *     source block.
+           *
+           * A producer stall can therefore create silence, never stale-audio
+           * repetition.  Initial PREBUFFER behavior is unchanged.
+           */
+          pb->underrun_count++;
+
+          if (available >= sizeof(int16_t))
             {
-              ret = nxsem_wait_uninterruptible(&pb->ring_data);
-              if (ret < 0)
+              want = available;
+              if (want > RV_SOURCE_BLOCK_BYTES)
                 {
+                  want = RV_SOURCE_BLOCK_BYTES;
+                }
+
+              want &= ~(size_t)1;
+
+              if (pb->stop_on_short_underrun)
+                {
+                  terminal_tail = true;
+                  pb->eos = 1;
+                  printf("[RV-PB] underrun #%lu short-fill=%zu "
+                         "buffered=%zu -> play terminal tail exactly\n",
+                         (unsigned long)pb->underrun_count,
+                         want, available);
+                }
+              else if (pb->underrun_count <= 4 ||
+                       (pb->underrun_count % 32) == 0)
+                {
+                  printf("[RV-PB] underrun #%lu short-fill=%zu "
+                         "buffered=%zu -> silence-pad slot\n",
+                         (unsigned long)pb->underrun_count,
+                         want, available);
+                }
+            }
+          else
+            {
+              memset(block, 0, sizeof(block));
+              want = RV_SOURCE_BLOCK_BYTES;
+              prime_silence = true;
+
+              if (available > 0)
+                {
+                  /* Preserve PCM16 alignment: discard a lone impossible
+                   * byte rather than carrying it into the next sample. */
+                  (void)rv_ring_read(pb, block, available);
+                }
+
+              if (pb->stop_on_short_underrun)
+                {
+                  printf("[RV-PB] underrun #%lu buffered=%zu "
+                         "-> no tail, stop now\n",
+                         (unsigned long)pb->underrun_count, available);
+                  pb->eos = 1;
+                  pb->stopped = 1;
+                  pb->terminal_tail_done = 1;
+
+                  if (pb->i2s != NULL && pb->i2s_started)
+                    {
+                      pb->i2s_started = 0;
+                      I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+                    }
+
+                  rv_signal_all(pb);
                   break;
                 }
-              continue;
-            }
 
-          pb->underrun_count++;
-          pb->state = RV_STATE_REBUFFER;
-          printf("[RV-PB] underrun #%lu buffered=%zu -> REBUFFER %u\n",
-                 (unsigned long)pb->underrun_count, available,
-                 RV_REBUFFER_BYTES);
-          continue;
+              if (pb->underrun_count <= 4 ||
+                  (pb->underrun_count % 32) == 0)
+                {
+                  printf("[RV-PB] underrun #%lu buffered=%zu "
+                         "-> silent DMA slot\n",
+                         (unsigned long)pb->underrun_count, available);
+                }
+            }
         }
 
       if (prime_silence)
@@ -880,6 +1035,31 @@ else if (pb->eos && available == 0)
               printf("[RV-PB] queue slot=%u failed=%d\n",
                      slot_index, ret);
             }
+          break;
+        }
+
+      if (terminal_tail)
+        {
+          int tail_ret = rv_wait_slot(pb, slot);
+
+          if (tail_ret < 0 && tail_ret != -ECANCELED && ret >= 0)
+            {
+              ret = tail_ret;
+            }
+
+          printf("[RV-PB] terminal tail complete source=%zu -> STOP\n", got);
+
+          pb->terminal_tail_done = 1;
+          pb->stopped = 1;
+          pb->state = RV_STATE_STOPPED;
+
+          if (pb->i2s != NULL && pb->i2s_started)
+            {
+              pb->i2s_started = 0;
+              I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+            }
+
+          rv_signal_all(pb);
           break;
         }
 
@@ -1132,6 +1312,13 @@ fail:
   return ret;
 }
 
+void robot_audio_playback_set_stop_on_short_underrun(bool enable)
+{
+  g_stop_on_short_underrun = enable ? 1 : 0;
+  printf("[RV-PB] short-tail policy=%s\n",
+         enable ? "play-real-tail-then-stop" : "normal");
+}
+
 int robot_audio_playback_open(void)
 {
   struct rv_playback_s *pb = &g_pb;
@@ -1144,6 +1331,7 @@ int robot_audio_playback_open(void)
     }
 
   memset(pb, 0, sizeof(*pb));
+  pb->stop_on_short_underrun = g_stop_on_short_underrun;
 
   if (ROBOT_VOICE_TTS_RATE != RV_TTS_SAMPLE_RATE ||
       ROBOT_VOICE_CHANNELS != RV_TTS_SOURCE_CHANNELS ||
@@ -1295,7 +1483,7 @@ int robot_audio_playback_write(const uint8_t *pcm, size_t len)
 
       if (pb->stopped)
         {
-          return -ECANCELED;
+          return pb->terminal_tail_done ? -EPIPE : -ECANCELED;
         }
 
       ret = rv_get_result(pb);
@@ -1365,7 +1553,7 @@ int robot_audio_playback_finish(void)
    * remains, the worker is allowed to drain that final aligned PCM tail.
    */
   pb->eos = 1;
-  printf("[RV-PB] TTS EOS buffered=%zu total_pcm=%zu\n",
+  printf("[RV-PB] producer EOS buffered=%zu total_pcm=%zu\n",
          rv_ring_count(pb), pb->total_written);
   rv_signal_all(pb);
 

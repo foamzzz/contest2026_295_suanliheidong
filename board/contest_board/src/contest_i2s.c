@@ -108,6 +108,7 @@ struct contest_i2s_xfer_s
   bool in_use;
   bool done_queued;
   bool dma_bound;
+  bool terminal;
   uint8_t desc_last;
   struct esp32s3_dmadesc_s desc[CONTEST_I2S_DMA_DESC_COUNT];
 };
@@ -184,6 +185,7 @@ struct contest_i2s_tx_s
   struct i2s_dev_s dev;
   spinlock_t lock;
   uint32_t rate;
+  uint8_t logical_width;
   uint8_t data_width;
   uint8_t channels;
   int dma_channel;
@@ -193,6 +195,8 @@ struct contest_i2s_tx_s
   bool streaming;
   bool reserved;
   bool hw_running;
+  bool terminal_stop_pending;
+  uint8_t terminal_stop_slot;
   FAR struct contest_i2s_xfer_s *done_head;
   FAR struct contest_i2s_xfer_s *done_tail;
   uint8_t fill_index;
@@ -218,6 +222,7 @@ struct contest_i2s_tx_s
   uint32_t timeout_desc_ctrl;
   FAR const void *timeout_desc_addr;
   struct work_s tx_work;
+  struct work_s tx_stop_work;
   struct contest_i2s_xfer_s xfer[CONTEST_I2S_TX_RING_SLOTS];
 };
 
@@ -1509,8 +1514,25 @@ static int contest_i2s_tx_bind_slot(FAR struct contest_i2s_tx_s *priv,
       return -ENOMEM;
     }
 
-  memcpy(xfer->dma_data, apb->samp + apb->curbyte,
-         CONTEST_I2S_TX_SLOT_BYTES);
+  if (priv->logical_width == 16)
+    {
+      FAR const int16_t *src =
+        (FAR const int16_t *)(apb->samp + apb->curbyte);
+      FAR uint32_t *dst = (FAR uint32_t *)xfer->dma_data;
+      unsigned int i;
+
+      for (i = 0; i < CONTEST_I2S_TX_SLOT_BYTES / sizeof(uint32_t); i++)
+        {
+          /* Sign-extend PCM16 into the high half of the 32-bit Philips
+           * slot.  Do not reinterpret the input buffer as 32-bit data. */
+          dst[i] = ((uint32_t)(int32_t)src[i]) << 16;
+        }
+    }
+  else
+    {
+      memcpy(xfer->dma_data, apb->samp + apb->curbyte,
+             CONTEST_I2S_TX_SLOT_BYTES);
+    }
   up_clean_dcache((uintptr_t)xfer->dma_data,
                   (uintptr_t)xfer->dma_data + CONTEST_I2S_TX_SLOT_BYTES);
 
@@ -1534,11 +1556,6 @@ static int contest_i2s_tx_bind_slot(FAR struct contest_i2s_tx_s *priv,
   xfer->dma_bound = true;
   priv->bound_slots++;
 
-  syslog(LOG_INFO,
-         "[C-I2S] tx GDMA-IMMUTABLE bind slot=%u dma=%p desc=%p "
-         "bound=%u/%u\n",
-         slot, xfer->dma_data, &xfer->desc[0],
-         priv->bound_slots, CONTEST_I2S_TX_RING_SLOTS);
   return OK;
 }
 
@@ -2052,14 +2069,15 @@ static void contest_i2s_tx_worker(FAR void *arg)
       xfer->result = OK;
       xfer->done_queued = false;
       xfer->in_use = false;
+      xfer->terminal = false;
 
       spin_unlock_irqrestore(&priv->lock, flags);
 
-      if (priv->done_count <= 4 || result < 0)
+      if (result < 0)
         {
-          syslog(LOG_INFO,
-                 "[C-I2S] tx safe-ring irq=%08lx bytes=%zu\n",
-                 (unsigned long)irq_status, nbytes);
+          syslog(LOG_ERR,
+                 "[C-I2S] tx completion failed irq=%08lx bytes=%zu rc=%d\n",
+                 (unsigned long)irq_status, nbytes, result);
         }
 
       if (callback != NULL && apb != NULL)
@@ -2067,6 +2085,63 @@ static void contest_i2s_tx_worker(FAR void *arg)
           callback(&priv->dev, apb, callback_arg, result);
           apb_free(apb);
         }
+    }
+}
+
+
+static void contest_i2s_tx_terminal_stop_worker(FAR void *arg)
+{
+  FAR struct contest_i2s_tx_s *priv = arg;
+  unsigned int slot;
+  bool schedule = false;
+  bool stopped = false;
+  irqstate_t flags;
+
+  flags = spin_lock_irqsave(&priv->lock);
+
+  if (!priv->terminal_stop_pending)
+    {
+      spin_unlock_irqrestore(&priv->lock, flags);
+      return;
+    }
+
+  slot = priv->terminal_stop_slot;
+  priv->terminal_stop_pending = false;
+
+  /*
+   * The terminal descriptor already has next=NULL, so GDMA cannot wrap back
+   * into stale PCM. Keep I2S alive until this delayed worker runs so the
+   * peripheral FIFO / shifter can emit the final real samples cleanly.
+   */
+  if (priv->hw_running)
+    {
+      contest_i2s_tx_stop_hw(priv);
+      stopped = true;
+    }
+
+  /*
+   * Publish terminal completion only after the hardware drain. The upper
+   * playback layer may issue AUDIOIOC_STOP immediately after this callback.
+   */
+  if (slot < CONTEST_I2S_TX_RING_SLOTS &&
+      priv->xfer[slot].in_use &&
+      !priv->xfer[slot].done_queued)
+    {
+      schedule = contest_i2s_tx_complete_slot(priv, slot);
+    }
+
+  spin_unlock_irqrestore(&priv->lock, flags);
+
+  if (stopped)
+    {
+      syslog(LOG_INFO,
+             "[C-I2S] tx terminal drain complete slot=%u delay_ms=%u\n",
+             slot, CONTEST_I2S_TX_FIFO_DRAIN_MS);
+    }
+
+  if (schedule && work_available(&priv->tx_work))
+    {
+      work_queue(HPWORK, &priv->tx_work, contest_i2s_tx_worker, priv, 0);
     }
 }
 
@@ -2079,6 +2154,7 @@ static int contest_i2s_tx_interrupt(int irq, FAR void *context, FAR void *arg)
   unsigned int slot;
   unsigned int i;
   bool schedule = false;
+  bool terminal_stop_schedule = false;
   bool fatal = false;
   irqstate_t flags;
 
@@ -2117,8 +2193,24 @@ static int contest_i2s_tx_interrupt(int irq, FAR void *context, FAR void *arg)
         {
           priv->done_irq_count++;
 
+          bool terminal_done;
+
           slot = priv->done_index;
-          if (contest_i2s_tx_complete_slot(priv, slot))
+          terminal_done = priv->xfer[slot].terminal;
+
+          if (terminal_done)
+            {
+              /*
+               * OUT_DONE means GDMA finished the descriptor, but the I2S FIFO
+               * / shifter may still contain the final samples. Do not stop HW
+               * or publish the terminal callback until the drain delay passes.
+               */
+              priv->streaming = false;
+              priv->terminal_stop_pending = true;
+              priv->terminal_stop_slot = (uint8_t)slot;
+              terminal_stop_schedule = true;
+            }
+          else if (contest_i2s_tx_complete_slot(priv, slot))
             {
               schedule = true;
             }
@@ -2129,15 +2221,6 @@ static int contest_i2s_tx_interrupt(int irq, FAR void *context, FAR void *arg)
               priv->ring_wrap_count++;
             }
 
-          if (priv->done_irq_count <= 8)
-            {
-              syslog(LOG_INFO,
-                     "[C-I2S] tx DONE irq=%lu release=%u next=%u "
-                     "queued=%u st=%08lx\n",
-                     (unsigned long)priv->done_irq_count, slot,
-                     priv->done_index, priv->queued_slots,
-                     (unsigned long)status);
-            }
         }
 
     }
@@ -2158,7 +2241,30 @@ static int contest_i2s_tx_interrupt(int irq, FAR void *context, FAR void *arg)
 
       priv->queued_slots = 0;
       priv->streaming = false;
+      priv->terminal_stop_pending = false;
       contest_i2s_tx_stop_hw(priv);
+    }
+
+  if (terminal_stop_schedule)
+    {
+      if (work_available(&priv->tx_stop_work))
+        {
+          work_queue(HPWORK, &priv->tx_stop_work,
+                     contest_i2s_tx_terminal_stop_worker, priv,
+                     MSEC2TICK(CONTEST_I2S_TX_FIFO_DRAIN_MS));
+        }
+      else
+        {
+          /* Defensive fallback: never leave I2S running forever. */
+          priv->terminal_stop_pending = false;
+          contest_i2s_tx_stop_hw(priv);
+          if (contest_i2s_tx_complete_slot(priv, priv->terminal_stop_slot))
+            {
+              schedule = true;
+            }
+          syslog(LOG_ERR,
+                 "[C-I2S] terminal drain worker busy; immediate fallback\n");
+        }
     }
 
   if (schedule && work_available(&priv->tx_work))
@@ -2177,9 +2283,13 @@ static int contest_i2s_txchannels(FAR struct i2s_dev_s *dev,
 {
   FAR struct contest_i2s_tx_s *priv = (FAR struct contest_i2s_tx_s *)dev;
 
+  syslog(LOG_INFO, "[C-I2S-DIAG] txchannels requested=%u\n", channels);
+
   /* One logical PCM channel is emitted in the physical left 32-bit slot. */
   if (channels != 1)
     {
+      syslog(LOG_INFO, "[C-I2S-DIAG] txchannels rejected=%u expected=1\n",
+             channels);
       return -ENOTSUP;
     }
 
@@ -2197,11 +2307,16 @@ static uint32_t contest_i2s_txsamplerate(FAR struct i2s_dev_s *dev,
 {
   FAR struct contest_i2s_tx_s *priv = (FAR struct contest_i2s_tx_s *)dev;
 
+  syslog(LOG_INFO, "[C-I2S-DIAG] txsamplerate requested=%lu expected=%u\n",
+         (unsigned long)rate, CONTEST_I2S_TX_RATE);
+
   if (rate != CONTEST_I2S_TX_RATE)
     {
       syslog(LOG_ERR,
              "[C-I2S] reject tx rate=%lu expected=%u\n",
              (unsigned long)rate, CONTEST_I2S_TX_RATE);
+      syslog(LOG_INFO, "[C-I2S-DIAG] txsamplerate rejected=%lu\n",
+             (unsigned long)rate);
       return 0;
     }
 
@@ -2218,6 +2333,9 @@ static uint32_t contest_i2s_txsamplerate(FAR struct i2s_dev_s *dev,
          (unsigned long)getreg32(I2S_TX_CLKM_CONF_REG(CONTEST_I2S_TX_PORT)),
          (unsigned long)getreg32(I2S_TX_CLKM_DIV_CONF_REG(CONTEST_I2S_TX_PORT)));
 
+  syslog(LOG_INFO, "[C-I2S-DIAG] txsamplerate applied=%lu\n",
+         (unsigned long)rate);
+
   return rate;
 }
 
@@ -2225,14 +2343,22 @@ static uint32_t contest_i2s_txdatawidth(FAR struct i2s_dev_s *dev, int bits)
 {
   FAR struct contest_i2s_tx_s *priv = (FAR struct contest_i2s_tx_s *)dev;
 
-  if (bits != CONTEST_I2S_TX_WIDTH)
+  syslog(LOG_INFO, "[C-I2S-DIAG] txdatawidth requested=%d wire_width=%u\n",
+         bits, CONTEST_I2S_TX_WIDTH);
+
+  if (bits != 16 && bits != CONTEST_I2S_TX_WIDTH)
     {
+      syslog(LOG_INFO, "[C-I2S-DIAG] txdatawidth rejected=%d\n", bits);
       return 0;
     }
 
-  priv->data_width = bits;
+  priv->logical_width = bits;
+  priv->data_width = CONTEST_I2S_TX_WIDTH;
   contest_i2s_tx_set_format(priv);
   contest_i2s_tx_set_rate(priv);
+  syslog(LOG_INFO,
+         "[C-I2S-DIAG] txdatawidth applied logical=%d wire_width=%u\n",
+         bits, CONTEST_I2S_TX_WIDTH);
   return bits;
 }
 
@@ -2247,8 +2373,13 @@ static int contest_i2s_send(FAR struct i2s_dev_s *dev,
   FAR struct contest_i2s_xfer_s *xfer;
   unsigned int slot;
   size_t nbytes;
+  size_t wire_bytes;
   bool need_bind;
-  bool start_now = false;
+  bool terminal_short;
+  bool was_streaming;
+  bool was_reserved;
+  bool slot_in_use;
+  bool slot_done_queued;
   irqstate_t flags;
   int ret = OK;
 
@@ -2256,25 +2387,59 @@ static int contest_i2s_send(FAR struct i2s_dev_s *dev,
 
   if (apb == NULL || callback == NULL || apb->samp == NULL)
     {
+      syslog(LOG_INFO, "[C-I2S-DIAG] send rejected invalid argument\n");
+      return -EINVAL;
+    }
+
+  if (apb->nbytes < apb->curbyte)
+    {
+      syslog(LOG_INFO, "[C-I2S-DIAG] send rejected curbyte beyond nbytes\n");
       return -EINVAL;
     }
 
   nbytes = apb->nbytes - apb->curbyte;
-  if (nbytes != CONTEST_I2S_TX_SLOT_BYTES || (nbytes & 3) != 0)
-    {
-      syslog(LOG_ERR,
-             "[C-I2S] immutable reject bytes=%zu expected=%u\n",
-             nbytes, CONTEST_I2S_TX_SLOT_BYTES);
-      return -EINVAL;
-    }
+  {
+    size_t expected = CONTEST_I2S_TX_SLOT_BYTES;
+    size_t align = sizeof(uint32_t);
+
+    if (priv->logical_width == 16)
+      {
+        expected /= 2;
+        align = sizeof(int16_t);
+      }
+
+    if (nbytes == 0 || nbytes > expected || (nbytes % align) != 0)
+      {
+        syslog(LOG_ERR,
+               "[C-I2S] reject bytes=%zu max=%zu align=%zu\n",
+               nbytes, expected, align);
+        return -EINVAL;
+      }
+
+    terminal_short = nbytes < expected;
+    wire_bytes = priv->logical_width == 16 ? nbytes * 2 : nbytes;
+
+    if (wire_bytes == 0 || wire_bytes > CONTEST_I2S_TX_SLOT_BYTES ||
+        (wire_bytes & 3) != 0)
+      {
+        syslog(LOG_ERR,
+               "[C-I2S] reject wire bytes=%zu max=%u\n",
+               wire_bytes, CONTEST_I2S_TX_SLOT_BYTES);
+        return -EINVAL;
+      }
+  }
 
   apb_reference(apb);
 
   flags = spin_lock_irqsave(&priv->lock);
   if (!priv->streaming || priv->reserved)
     {
+      was_streaming = priv->streaming;
+      was_reserved = priv->reserved;
       spin_unlock_irqrestore(&priv->lock, flags);
       apb_free(apb);
+      syslog(LOG_INFO, "[C-I2S-DIAG] send rejected busy streaming=%d reserved=%d\n",
+             was_streaming ? 1 : 0, was_reserved ? 1 : 0);
       return -EBUSY;
     }
 
@@ -2283,17 +2448,33 @@ static int contest_i2s_send(FAR struct i2s_dev_s *dev,
 
   if (xfer->in_use || xfer->done_queued)
     {
+      slot_in_use = xfer->in_use;
+      slot_done_queued = xfer->done_queued;
       spin_unlock_irqrestore(&priv->lock, flags);
       apb_free(apb);
+      syslog(LOG_INFO,
+             "[C-I2S-DIAG] send rejected slot=%u in_use=%d done_queued=%d\n",
+             slot, slot_in_use ? 1 : 0, slot_done_queued ? 1 : 0);
       return -EBUSY;
     }
 
   need_bind = !xfer->dma_bound;
 
+  if (terminal_short && need_bind)
+    {
+      spin_unlock_irqrestore(&priv->lock, flags);
+      apb_free(apb);
+      syslog(LOG_ERR,
+             "[C-I2S] terminal-short rejected before ring bind slot=%u\n",
+             slot);
+      return -EINVAL;
+    }
+
   if (need_bind && priv->hw_running)
     {
       spin_unlock_irqrestore(&priv->lock, flags);
       apb_free(apb);
+      syslog(LOG_INFO, "[C-I2S-DIAG] send rejected bind while hw_running\n");
       return -EIO;
     }
 
@@ -2310,13 +2491,60 @@ static int contest_i2s_send(FAR struct i2s_dev_s *dev,
     }
   else
     {
-      /* Running phase: descriptors remain frozen; update only the completed
-       * slot's private DMA payload before it returns around the ring. */
-      memcpy(xfer->dma_data, apb->samp + apb->curbyte,
-             CONTEST_I2S_TX_SLOT_BYTES);
+      uint32_t queued;
+
+      /* Normal requests retain the existing 2048-byte cyclic descriptor.
+       * A short request is terminal: copy only real samples, rebuild this
+       * already-completed descriptor at the real wire length, and set
+       * next=NULL so hardware cannot loop into an old audio slot. */
+      if (priv->logical_width == 16)
+        {
+          FAR const int16_t *src =
+            (FAR const int16_t *)(apb->samp + apb->curbyte);
+          FAR uint32_t *dst = (FAR uint32_t *)xfer->dma_data;
+          unsigned int i;
+
+          for (i = 0; i < wire_bytes / sizeof(uint32_t); i++)
+            {
+              dst[i] = ((uint32_t)(int32_t)src[i]) << 16;
+            }
+        }
+      else
+        {
+          memcpy(xfer->dma_data, apb->samp + apb->curbyte, wire_bytes);
+        }
+
       up_clean_dcache((uintptr_t)xfer->dma_data,
-                      (uintptr_t)xfer->dma_data +
-                      CONTEST_I2S_TX_SLOT_BYTES);
+                      (uintptr_t)xfer->dma_data + wire_bytes);
+
+      if (terminal_short)
+        {
+          memset(xfer->desc, 0, sizeof(xfer->desc));
+          queued = esp32s3_dma_setup(xfer->desc,
+                                     CONTEST_I2S_DMA_DESC_COUNT,
+                                     xfer->dma_data, wire_bytes,
+                                     true, priv->dma_channel);
+          if (queued != wire_bytes)
+            {
+              ret = -ENOMEM;
+              goto fail_reserved;
+            }
+
+          ret = contest_i2s_tx_desc_last(xfer, NULL);
+          if (ret < 0)
+            {
+              goto fail_reserved;
+            }
+
+          xfer->desc[xfer->desc_last].next = NULL;
+          up_clean_dcache((uintptr_t)xfer->desc,
+                          (uintptr_t)xfer->desc + sizeof(xfer->desc));
+
+          syslog(LOG_INFO,
+                 "[C-I2S] tx terminal-short slot=%u wire_bytes=%zu "
+                 "next=NULL\n",
+                 slot, wire_bytes);
+        }
     }
 
   flags = spin_lock_irqsave(&priv->lock);
@@ -2325,6 +2553,7 @@ static int contest_i2s_send(FAR struct i2s_dev_s *dev,
       priv->reserved = false;
       spin_unlock_irqrestore(&priv->lock, flags);
       apb_free(apb);
+      syslog(LOG_INFO, "[C-I2S-DIAG] send canceled after bind\n");
       return -ECANCELED;
     }
 
@@ -2332,9 +2561,10 @@ static int contest_i2s_send(FAR struct i2s_dev_s *dev,
   xfer->apb = apb;
   xfer->callback = callback;
   xfer->arg = arg;
-  xfer->nbytes = CONTEST_I2S_TX_SLOT_BYTES;
+  xfer->nbytes = wire_bytes;
   xfer->result = -EINPROGRESS;
   xfer->done_queued = false;
+  xfer->terminal = terminal_short;
   xfer->in_use = true;
 
   priv->fill_index++;
@@ -2371,25 +2601,16 @@ static int contest_i2s_send(FAR struct i2s_dev_s *dev,
           priv->reserved = false;
           spin_unlock_irqrestore(&priv->lock, flags);
           apb_free(apb);
+          syslog(LOG_INFO, "[C-I2S-DIAG] send rejected immutable link rc=%d\n",
+                 ret);
           return ret;
         }
 
       contest_i2s_tx_start_ring(priv);
-      start_now = true;
     }
 
   priv->reserved = false;
   spin_unlock_irqrestore(&priv->lock, flags);
-
-  if (priv->submit_count <= 8 || start_now)
-    {
-      syslog(LOG_INFO,
-             "[C-I2S] tx GDMA-IMMUTABLE submit=%lu slot=%u bytes=%zu "
-             "queued=%u bound=%u started=%d\n",
-             (unsigned long)priv->submit_count, slot, nbytes,
-             priv->queued_slots, priv->bound_slots,
-             priv->hw_running ? 1 : 0);
-    }
 
   return OK;
 
@@ -2398,6 +2619,7 @@ fail_reserved:
   priv->reserved = false;
   spin_unlock_irqrestore(&priv->lock, flags);
   apb_free(apb);
+  syslog(LOG_INFO, "[C-I2S-DIAG] send failed bind rc=%d\n", ret);
   return ret;
 }
 
@@ -2413,7 +2635,8 @@ static int contest_i2s_tx_ioctl(FAR struct i2s_dev_s *dev, int cmd,
   irqstate_t flags;
   int ret;
 
-  (void)arg;
+  syslog(LOG_INFO, "[C-I2S-DIAG] ioctl cmd=0x%x arg=0x%lx\n",
+         cmd, arg);
 
   switch (cmd)
     {
@@ -2422,6 +2645,11 @@ static int contest_i2s_tx_ioctl(FAR struct i2s_dev_s *dev, int cmd,
         if (priv->streaming || priv->hw_running || priv->done_head != NULL)
           {
             spin_unlock_irqrestore(&priv->lock, flags);
+            syslog(LOG_INFO,
+                   "[C-I2S-DIAG] ioctl START rejected busy streaming=%d "
+                   "hw_running=%d done_head=%p\n",
+                   priv->streaming ? 1 : 0, priv->hw_running ? 1 : 0,
+                   priv->done_head);
             return -EBUSY;
           }
 
@@ -2432,6 +2660,8 @@ static int contest_i2s_tx_ioctl(FAR struct i2s_dev_s *dev, int cmd,
             syslog(LOG_ERR,
                    "[C-I2S] tx private DMA allocation failed bytes=%u\n",
                    CONTEST_I2S_TX_RING_SLOTS * CONTEST_I2S_TX_SLOT_BYTES);
+            syslog(LOG_INFO, "[C-I2S-DIAG] ioctl START allocation rc=%d\n",
+                   ret);
             return ret;
           }
 
@@ -2440,11 +2670,15 @@ static int contest_i2s_tx_ioctl(FAR struct i2s_dev_s *dev, int cmd,
           {
             spin_unlock_irqrestore(&priv->lock, flags);
             contest_i2s_tx_free_dma_slots(priv);
+            syslog(LOG_INFO,
+                   "[C-I2S-DIAG] ioctl START rejected busy after allocation\n");
             return -EBUSY;
           }
 
         priv->streaming = true;
         priv->reserved = false;
+        priv->terminal_stop_pending = false;
+        priv->terminal_stop_slot = 0;
         priv->fill_index = 0;
         priv->done_index = 0;
         priv->queued_slots = 0;
@@ -2472,6 +2706,7 @@ static int contest_i2s_tx_ioctl(FAR struct i2s_dev_s *dev, int cmd,
             xfer->result = OK;
             xfer->in_use = false;
             xfer->done_queued = false;
+            xfer->terminal = false;
             xfer->desc_last = 0;
             memset(xfer->desc, 0, sizeof(xfer->desc));
           }
@@ -2485,11 +2720,13 @@ static int contest_i2s_tx_ioctl(FAR struct i2s_dev_s *dev, int cmd,
                (unsigned long)priv->rate,
                CONTEST_I2S_TX_RING_SLOTS,
                CONTEST_I2S_TX_SLOT_BYTES);
+        syslog(LOG_INFO, "[C-I2S-DIAG] ioctl START rc=0\n");
         return OK;
 
       case AUDIOIOC_STOP:
         flags = spin_lock_irqsave(&priv->lock);
         priv->streaming = false;
+        priv->terminal_stop_pending = false;
 
         if (priv->hw_running)
           {
@@ -2514,6 +2751,7 @@ static int contest_i2s_tx_ioctl(FAR struct i2s_dev_s *dev, int cmd,
             memset(xfer->desc, 0, sizeof(xfer->desc));
             xfer->desc_last = 0;
             xfer->dma_bound = false;
+            xfer->terminal = false;
             up_clean_dcache((uintptr_t)xfer->desc,
                             (uintptr_t)xfer->desc + sizeof(xfer->desc));
           }
@@ -2551,9 +2789,38 @@ static int contest_i2s_tx_ioctl(FAR struct i2s_dev_s *dev, int cmd,
               }
           }
 
+        syslog(LOG_INFO, "[C-I2S-DIAG] ioctl STOP rc=0\n");
         return OK;
 
+      case AUDIOIOC_GETBUFFERINFO:
+        {
+          FAR struct ap_buffer_info_s *info =
+            (FAR struct ap_buffer_info_s *)arg;
+
+          if (info == NULL)
+            {
+              syslog(LOG_INFO,
+                     "[C-I2S-DIAG] GETBUFFERINFO rejected null arg\n");
+              return -EINVAL;
+            }
+
+          info->nbuffers = CONTEST_I2S_TX_RING_SLOTS;
+          info->buffer_size = CONTEST_I2S_TX_SLOT_BYTES;
+          if (priv->logical_width == 16)
+            {
+              info->buffer_size /= 2;
+            }
+
+          syslog(LOG_INFO,
+                 "[C-I2S-DIAG] GETBUFFERINFO buffer_size=%u nbuffers=%u "
+                 "logical_width=%u wire_bytes=%u\n",
+                 info->buffer_size, info->nbuffers, priv->logical_width,
+                 CONTEST_I2S_TX_SLOT_BYTES);
+          return OK;
+        }
+
       default:
+        syslog(LOG_INFO, "[C-I2S-DIAG] unsupported ioctl cmd=0x%x\n", cmd);
         return -ENOTTY;
     }
 }
@@ -2571,6 +2838,8 @@ static FAR struct i2s_dev_s *contest_i2s1_initialize(void)
     }
 
   priv->rate = CONTEST_I2S_TX_RATE;
+  /* The contest speaker is normally fed by the Audio PCM16 upper-half. */
+  priv->logical_width = 16;
   priv->data_width = CONTEST_I2S_TX_WIDTH;
   priv->channels = 1;
   contest_i2s_tx_configure(priv);

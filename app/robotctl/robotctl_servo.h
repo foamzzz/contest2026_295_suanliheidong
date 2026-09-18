@@ -35,7 +35,14 @@ enum robotctl_servo_e
 struct robotctl_servo_ctx_s
 {
   int fd;
+  bool (*cancel_check)(void *arg);
+  void *cancel_arg;
   int angle[ROBOTCTL_SERVO_COUNT];
+  bool angle_known[ROBOTCTL_SERVO_COUNT];
+  bool pwm_enabled;
+  unsigned int command_count;
+  unsigned int skipped_count;
+  unsigned int total_angle_delta;
 };
 
 /****************************************************************************

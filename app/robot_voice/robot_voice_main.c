@@ -7,17 +7,110 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "agent_config.h"
 #include "core/message_bus.h"
+#include "core/message_bus_tap.h"
 #include "infra/config_store.h"
+#include "infra/network_manager.h"
 #include "mimo_asr.h"
 #include "mimo_llm.h"
 #include "mimo_tts.h"
 #include "robot_voice_capture.h"
 #include "robot_audio_playback.h"
+#include "robot_music_player.h"
+#include "robot_expression.h"
+#include "robot_motion.h"
+#include "robot_motion_tool.h"
 #include "robot_voice_config.h"
+#include "robot_proactive.h"
+#include "robot_music_observer.h"
+#include "robot_network_adapter.h"
+#include "robot_ffmpeg_amix_compat.h"
+
+#define ROBOT_MEDIA_STARTUP_GRACE_US       (1500 * 1000)
+
+static bool g_robot_media_initialized;
+static pthread_mutex_t g_robot_media_init_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * Media lifecycle policy
+ * ----------------------
+ *
+ * Do not start mediad from voice_channel_init() and do not poll wlan0 while
+ * set_wifi is associating / obtaining DHCP.
+ *
+ * Media follows the same lazy one-shot lifecycle style as the OLED: the first
+ * eligible caller performs initialization, and all later callers reuse it.  In the normal vela> workflow:
+ *
+ *   set_wifi ...
+ *     -> Wi-Fi/DHCP completes
+ *   set_voice_asr ...   (or set_voice_tts ...)
+ *     -> robot_media_runtime_init_once()
+ *     -> mediad &
+ *     -> IPC startup grace
+ *   ask ...
+ *
+ * This gives Media time to become ready before the first ask, including the
+ * official "播放" NL fast-path which can reach music_play before the normal
+ * outbound "working" / OLED status is emitted.
+ *
+ * network_is_connected() is queried once at the trigger point.  There is no
+ * background polling and contest code does not modify wlan0.
+ */
+static int robot_media_runtime_init_once(void)
+{
+  int ret;
+
+  pthread_mutex_lock(&g_robot_media_init_lock);
+
+  if (g_robot_media_initialized)
+    {
+      pthread_mutex_unlock(&g_robot_media_init_lock);
+      return 0;
+    }
+
+  if (!network_is_connected())
+    {
+      printf("[RV-MEDIA] init deferred: WiFi is not connected yet\n");
+      pthread_mutex_unlock(&g_robot_media_init_lock);
+      return -ENETDOWN;
+    }
+
+  printf("[RV-MEDIA] init begin -> launching: mediad &\n");
+
+  /*
+   * On this NuttX/OpenVela shell, system("mediad &") may return -1 even when
+   * the background mediad task was successfully created.  The runtime log
+   * then shows "mediad [pid:prio]" and Media graph initialization.
+   *
+   * Therefore the system() return value is not a reliable launch-success
+   * signal for a background NSH command.  Mark the one-shot launch as claimed
+   * before calling system() so set_voice_tts cannot start a second daemon while
+   * the first one is booting.
+   */
+  g_robot_media_initialized = true;
+  ret = system("mediad &");
+  if (ret != 0)
+    {
+      printf("[RV-MEDIA] background shell returned rc=%d; "
+             "continuing because mediad may already be running\n", ret);
+    }
+
+  /*
+   * Give the first daemon time to publish Media IPC before the first ask.
+   */
+  usleep(ROBOT_MEDIA_STARTUP_GRACE_US);
+
+  printf("[RV-MEDIA] init complete; subsequent calls are no-op\n");
+  pthread_mutex_unlock(&g_robot_media_init_lock);
+  return 0;
+}
+
+#include "robot_skill_installer.h"
+#include "robot_world_state.h"
 
 /* Strong definitions live in the application entry object so the linker
  * cannot discard them while resolving ai_agent's weak simulation stubs. */
@@ -32,10 +125,93 @@ static volatile int g_voice_running;
 static volatile int g_voice_speaking;
 static volatile int g_voice_oneshot;
 static volatile int g_voice_thread_valid;
+static volatile bool g_voice_reply_pending;
 static volatile bool g_voice_stop_requested;
 static volatile bool g_voice_worker_exited;
 static pthread_t g_voice_thread;
 static int robot_voice_pcm_sink(const uint8_t *pcm, size_t len, void *arg);
+static bool g_cli_tap_registered;
+extern pthread_mutex_t g_stdout_lock;
+
+/* The official Agent emits a CLI working-status message immediately before
+ * each LLM request.  The contest app owns the outbound tap and mirrors the
+ * official CLI formatting while using that message as the expression hook.
+ */
+static const char *const g_cli_working_phrases[] =
+{
+  "\xE6\xAD\xA3\xE5\x9C\xA8\xE6\x80\x9D\xE8\x80\x83\xE4\xB8\xAD\x2E\x2E\x2E",
+  "\xE7\xA8\x8D\xE7\xAD\x89\xEF\xBC\x8C\xE5\xA4\x84\xE7\x90\x86\xE4\xB8\xAD\x2E\x2E\x2E",
+  "\xE8\xAE\xA9\xE6\x88\x91\xE6\x9F\xA5\xE4\xB8\x80\xE4\xB8\x8B\xE2\x80\xA6",
+  "\xE6\xAD\xA3\xE5\x9C\xA8\xE5\x88\x86\xE6\x9E\x90\x2E\x2E\x2E",
+  "\xE9\xA9\xAC\xE4\xB8\x8A\xE5\xA5\xBD\x2E\x2E\x2E",
+};
+
+static bool robot_voice_is_cli_working_status(const char *text)
+{
+  unsigned int i;
+
+  if (text == NULL)
+    {
+      return false;
+    }
+
+  for (i = 0; i < sizeof(g_cli_working_phrases) /
+                  sizeof(g_cli_working_phrases[0]); i++)
+    {
+      if (strcmp(text, g_cli_working_phrases[i]) == 0)
+        {
+          return true;
+        }
+    }
+
+  return false;
+}
+
+static void robot_voice_cli_outbound_tap(const agent_msg_t *msg,
+                                         void *cookie)
+{
+  bool working;
+
+  (void)cookie;
+  if (msg == NULL || msg->content == NULL)
+    {
+      return;
+    }
+
+  working = robot_voice_is_cli_working_status(msg->content);
+  if (working)
+    {
+      robot_world_state_set_conversation_active(true);
+      (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_AGENT,
+                                  ROBOT_EXPRESSION_THINKING, 0);
+      printf("[RV-EXPR] CLI working status -> thinking\n");
+    }
+  else
+    {
+      robot_world_state_set_conversation_active(false);
+      (void)robot_expression_clear(ROBOT_EXPRESSION_SOURCE_AGENT);
+      printf("[RV-EXPR] CLI reply -> clear agent expression\n");
+    }
+
+  /* mbus_tap consumes the message, so preserve the official CLI output. */
+  pthread_mutex_lock(&g_stdout_lock);
+  printf("\n[Agent]: %s\nvela> ", msg->content);
+  fflush(stdout);
+  pthread_mutex_unlock(&g_stdout_lock);
+}
+
+static unsigned long long robot_voice_now_ms(void)
+{
+  struct timespec ts;
+
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+    {
+      return 0;
+    }
+
+  return (unsigned long long)ts.tv_sec * 1000ULL +
+         (unsigned long long)ts.tv_nsec / 1000000ULL;
+}
 
 enum contest_voice_state_e
 {
@@ -234,12 +410,80 @@ static void contest_voice_wait_for_reply_cycle(void)
     }
 }
 
+
+#define ROBOT_VOICE_LOCAL_MUSIC_PATH "/etc/media/test.wav"
+
+static bool robot_voice_rewrite_local_music_request(const char *text,
+                                                     char *out,
+                                                     size_t out_size)
+{
+  static const char *const exact_requests[] =
+  {
+    "播放音乐",
+    "播放测试音乐",
+    "播放本地音乐",
+    "放音乐",
+    "放一下音乐",
+    "放点音乐",
+    "放一首音乐",
+    "来点音乐",
+    "来首音乐",
+    "给我放音乐",
+    "给我放点音乐",
+    "给我来点音乐",
+    "给我来首音乐",
+  };
+  unsigned int i;
+  bool explicit_local = false;
+
+  if (text == NULL || out == NULL || out_size == 0)
+    {
+      return false;
+    }
+
+  if (strstr(text, "test.wav") != NULL ||
+      strstr(text, "测试音乐") != NULL ||
+      strstr(text, "本地音乐") != NULL)
+    {
+      explicit_local = true;
+    }
+
+  if (!explicit_local)
+    {
+      for (i = 0; i < sizeof(exact_requests) / sizeof(exact_requests[0]); i++)
+        {
+          if (strcmp(text, exact_requests[i]) == 0)
+            {
+              explicit_local = true;
+              break;
+            }
+        }
+    }
+
+  if (!explicit_local)
+    {
+      return false;
+    }
+
+  /*
+   * Important: do not include the Chinese fast-path trigger "播放" or the
+   * token "play " (with a trailing space) in the rewritten Agent message.
+   * The official agent_loop checks those before the LLM.  "robot_play_music"
+   * contains "play_" and therefore does not match that English trigger.
+   */
+  snprintf(out, out_size,
+           "请调用 robot_play_music，参数 path 设为 %s",
+           ROBOT_VOICE_LOCAL_MUSIC_PATH);
+  return true;
+}
+
 static void *voice_record_worker(void *arg)
 {
   size_t pcm_cap = (size_t)ROBOT_VOICE_CAPTURE_RATE * 2 *
                    ROBOT_VOICE_CAPTURE_SECONDS;
   uint8_t *pcm = malloc(pcm_cap);
   char text[512];
+  char routed_text[512];
   (void)arg;
 
   if (pcm == NULL)
@@ -254,6 +498,8 @@ static void *voice_record_worker(void *arg)
       int ret;
 
       contest_voice_set_state(CONTEST_VOICE_RECORDING);
+      (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_VOICE,
+                                  ROBOT_EXPRESSION_LISTENING, 0);
       ret = robot_voice_capture_record_interruptible(
           pcm, pcm_cap, &pcm_len, ROBOT_VOICE_CAPTURE_SECONDS * 1000,
           &g_voice_stop_requested);
@@ -275,6 +521,9 @@ static void *voice_record_worker(void *arg)
         }
       if (ret < 0 || text[0] == '\0')
         {
+          (void)robot_expression_clear(ROBOT_EXPRESSION_SOURCE_VOICE);
+          (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_SYSTEM,
+                                      ROBOT_EXPRESSION_ERROR, 1500);
           printf("[contest_voice] ASR failed: %d\n", ret);
           if (g_voice_oneshot)
             {
@@ -284,16 +533,36 @@ static void *voice_record_worker(void *arg)
         }
 
       printf("[RV-ASR] text: %s\n", text);
+      robot_world_state_note_user_activity();
+      (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_VOICE,
+                                  ROBOT_EXPRESSION_THINKING, 0);
+
+      const char *agent_text = text;
+      if (robot_voice_rewrite_local_music_request(text, routed_text,
+                                                   sizeof(routed_text)))
+        {
+          agent_text = routed_text;
+          printf("[RV-MUSIC-ROUTE] rewrite: '%s' -> '%s'\n",
+                 text, agent_text);
+        }
+
       agent_msg_t msg;
       memset(&msg, 0, sizeof(msg));
       strncpy(msg.channel, AGENT_CHAN_VOICE, sizeof(msg.channel) - 1);
       strncpy(msg.chat_id, "voice", sizeof(msg.chat_id) - 1);
-      msg.content = strdup(text);
+      msg.content = strdup(agent_text);
       contest_voice_set_state(CONTEST_VOICE_WAIT_AGENT);
+      robot_world_state_set_conversation_active(true);
       printf("[RV-VOICE] push inbound voice:voice\n");
+      g_voice_reply_pending = true;
       if (msg.content == NULL || message_bus_push_inbound(&msg) != OK)
         {
           free(msg.content);
+          g_voice_reply_pending = false;
+          robot_world_state_set_conversation_active(false);
+          (void)robot_expression_clear(ROBOT_EXPRESSION_SOURCE_VOICE);
+          (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_SYSTEM,
+                                      ROBOT_EXPRESSION_ERROR, 1500);
           printf("[contest_voice] message bus submit failed\n");
           if (g_voice_oneshot)
             {
@@ -312,10 +581,21 @@ static void *voice_record_worker(void *arg)
 
 cleanup:
   free(pcm);
+  if (!g_voice_reply_pending)
+    {
+      (void)robot_expression_clear(ROBOT_EXPRESSION_SOURCE_VOICE);
+    }
   pthread_mutex_lock(&g_voice_lock);
   g_voice_running = 0;
   g_voice_worker_exited = true;
   contest_voice_set_state(CONTEST_VOICE_IDLE);
+
+  /*
+   * Force the contest-local FFmpeg amix compatibility object into libapps.
+   * The function itself is intentionally a no-op.
+   */
+  robot_ffmpeg_amix_compat_link_anchor();
+
   pthread_mutex_unlock(&g_voice_lock);
   printf("[contest_voice] worker cleanup\n");
   return NULL;
@@ -327,9 +607,50 @@ int voice_channel_init(void)
   g_voice_speaking = 0;
   g_voice_oneshot = 0;
   g_voice_thread_valid = 0;
+  g_voice_reply_pending = false;
   g_voice_stop_requested = false;
   g_voice_worker_exited = true;
   contest_voice_set_state(CONTEST_VOICE_IDLE);
+
+  /*
+   * Wi-Fi ownership policy:
+   * Do not start the contest-local RV-NET guard here.
+   *
+   * The official Agent/network manager is the single owner of wlan0.
+   * The former guard could issue ifdown/ifup/renew while set_wifi was still
+   * associating or obtaining DHCP, which could make netlib_obtain_ipv4addr()
+   * fail and leave set_wifi unable to connect.
+   */
+  printf("[contest_voice] RV-NET active repair disabled; official network manager owns wlan0\n");
+
+  if (robot_skill_installer_ensure() < 0)
+    {
+      printf("[contest_voice] proactive skill unavailable\n");
+    }
+  (void)robot_expression_register_tool();
+  (void)robot_motion_register_tool();
+  (void)robot_music_register_tool();
+  if (!g_cli_tap_registered)
+    {
+      if (mbus_tap_register(AGENT_CHAN_CLI,
+                            robot_voice_cli_outbound_tap, NULL) == OK)
+        {
+          g_cli_tap_registered = true;
+          printf("[RV-EXPR] CLI outbound tap registered\n");
+        }
+      else
+        {
+          printf("[RV-EXPR] CLI outbound tap unavailable\n");
+        }
+    }
+  /*
+   * Intentionally no runtime/network bootstrap worker here.
+   *
+   * set_wifi runs with no contest-side wlan0 polling.  mediad is started later
+   * by the first successful set_voice_asr / set_voice_tts call after Wi-Fi is
+   * already connected.
+   */
+  printf("[contest_voice] no background Wi-Fi polling; Media starts during post-WiFi voice setup\n");
   printf("[contest_voice] voice_channel_init\n");
   return 0;
 }
@@ -344,6 +665,7 @@ static int voice_channel_start_mode(int oneshot)
     }
   g_voice_running = 1;
   g_voice_oneshot = oneshot;
+  g_voice_reply_pending = false;
   g_voice_stop_requested = false;
   g_voice_worker_exited = false;
   contest_voice_set_state(CONTEST_VOICE_RECORDING);
@@ -401,6 +723,8 @@ int voice_channel_stop(void)
       return 0;
     }
   g_voice_stop_requested = true;
+  g_voice_reply_pending = false;
+  (void)robot_expression_clear(ROBOT_EXPRESSION_SOURCE_VOICE);
   state = g_voice_state;
   contest_voice_set_state(CONTEST_VOICE_STOPPING);
   tid = g_voice_thread;
@@ -437,6 +761,10 @@ int voice_channel_speak(const char *text)
     }
   if (strcmp(g_voice_tts_backend, "mimo-v2.5-tts") != 0)
     {
+      g_voice_reply_pending = false;
+      (void)robot_expression_clear(ROBOT_EXPRESSION_SOURCE_VOICE);
+      (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_SYSTEM,
+                                  ROBOT_EXPRESSION_ERROR, 1500);
       return -ENOSYS;
     }
 
@@ -444,17 +772,40 @@ int voice_channel_speak(const char *text)
   ret = voice_get_api_key(key, sizeof(key));
   if (ret < 0)
     {
+      g_voice_reply_pending = false;
+      (void)robot_expression_clear(ROBOT_EXPRESSION_SOURCE_VOICE);
+      (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_SYSTEM,
+                                  ROBOT_EXPRESSION_ERROR, 1500);
       pthread_mutex_unlock(&g_voice_speak_lock);
       return ret;
+    }
+  if (robot_motion_is_busy())
+    {
+      g_voice_reply_pending = false;
+      (void)robot_expression_clear(ROBOT_EXPRESSION_SOURCE_VOICE);
+      printf("[POWER-SAFE] mono_ms=%llu TTS_REJECT motion_active\n",
+             robot_voice_now_ms());
+      (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_SYSTEM,
+                                  ROBOT_EXPRESSION_ERROR, 1500);
+      pthread_mutex_unlock(&g_voice_speak_lock);
+      return -EBUSY;
     }
   ret = robot_audio_playback_open();
   if (ret < 0)
     {
+      g_voice_reply_pending = false;
+      (void)robot_expression_clear(ROBOT_EXPRESSION_SOURCE_VOICE);
+      (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_SYSTEM,
+                                  ROBOT_EXPRESSION_ERROR, 1500);
       pthread_mutex_unlock(&g_voice_speak_lock);
       return ret;
     }
   g_voice_speaking = 1;
+  robot_world_state_set_tts_active(true);
   contest_voice_set_state(CONTEST_VOICE_SPEAKING);
+  printf("[POWER-SAFE] mono_ms=%llu TTS_START\n", robot_voice_now_ms());
+  (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_VOICE,
+                              ROBOT_EXPRESSION_SPEAKING, 0);
   printf("[contest_voice] voice_channel_speak text_bytes=%zu\n", strlen(text));
   ret = mimo_tts_speak_stream(key, text, robot_voice_pcm_sink, NULL);
   if (ret == 0)
@@ -463,6 +814,17 @@ int voice_channel_speak(const char *text)
     }
   robot_audio_playback_close();
   g_voice_speaking = 0;
+  robot_world_state_set_tts_active(false);
+  robot_world_state_set_conversation_active(false);
+  g_voice_reply_pending = false;
+  printf("[POWER-SAFE] mono_ms=%llu TTS_DONE rc=%d\n",
+         robot_voice_now_ms(), ret);
+  (void)robot_expression_clear(ROBOT_EXPRESSION_SOURCE_VOICE);
+  if (ret < 0)
+    {
+      (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_SYSTEM,
+                                  ROBOT_EXPRESSION_ERROR, 1500);
+    }
   memset(key, 0, sizeof(key));
   if (g_voice_running && !g_voice_stop_requested)
     {
@@ -482,12 +844,26 @@ int voice_channel_test_tts(const char *text, const char *out_path)
       strcmp(g_voice_tts_backend, "mimo-v2.5-tts") != 0 ||
       voice_get_api_key(key, sizeof(key)) < 0)
     {
+      (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_SYSTEM,
+                                  ROBOT_EXPRESSION_ERROR, 1500);
       return -EINVAL;
+    }
+
+  if (robot_motion_is_busy())
+    {
+      printf("[POWER-SAFE] mono_ms=%llu TTS_REJECT motion_active\n",
+             robot_voice_now_ms());
+      (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_SYSTEM,
+                                  ROBOT_EXPRESSION_ERROR, 1500);
+      memset(key, 0, sizeof(key));
+      return -EBUSY;
     }
 
   fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd < 0)
     {
+      (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_SYSTEM,
+                                  ROBOT_EXPRESSION_ERROR, 1500);
       return -errno;
     }
   sink.fd = fd;
@@ -495,10 +871,15 @@ int voice_channel_test_tts(const char *text, const char *out_path)
   ret = robot_audio_playback_open();
   if (ret < 0)
     {
+      (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_SYSTEM,
+                                  ROBOT_EXPRESSION_ERROR, 1500);
       close(fd);
       return ret;
     }
   g_voice_speaking = 1;
+  robot_world_state_set_tts_active(true);
+  (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_VOICE,
+                              ROBOT_EXPRESSION_SPEAKING, 0);
   ret = mimo_tts_speak_stream(key, text, robot_voice_file_sink, &sink);
   if (ret == 0)
     {
@@ -506,6 +887,13 @@ int voice_channel_test_tts(const char *text, const char *out_path)
     }
   robot_audio_playback_close();
   g_voice_speaking = 0;
+  robot_world_state_set_tts_active(false);
+  (void)robot_expression_clear(ROBOT_EXPRESSION_SOURCE_VOICE);
+  if (ret < 0)
+    {
+      (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_SYSTEM,
+                                  ROBOT_EXPRESSION_ERROR, 1500);
+    }
   close(fd);
   printf("[contest_voice] voice_channel_test_tts text_len=%zu path=%s rc=%d\n",
          strlen(text), out_path, ret);
@@ -575,6 +963,15 @@ int voice_tts_set_backend(const char *name)
 
   strncpy(g_voice_tts_backend, name, sizeof(g_voice_tts_backend) - 1);
   g_voice_tts_backend[sizeof(g_voice_tts_backend) - 1] = '\0';
+
+  /*
+   * In the normal vela> workflow this runs after set_wifi.  Start Media here
+   * rather than waiting for the first music tool: the official "播放" fast-path
+   * can call music_play before the outbound working/OLED status exists.
+   * Media initialization is one-shot, like the OLED initializer.
+   * Media failure must not make backend selection itself fail.
+   */
+  (void)robot_media_runtime_init_once();
   return 0;
 }
 
@@ -592,6 +989,12 @@ int voice_asr_set_backend(const char *name)
 
   strncpy(g_voice_asr_backend, name, sizeof(g_voice_asr_backend) - 1);
   g_voice_asr_backend[sizeof(g_voice_asr_backend) - 1] = '\0';
+
+  /*
+   * Whichever set_voice_* command runs first after Wi-Fi starts Media.
+   * The one-shot guard makes the second command a no-op for Media startup.
+   */
+  (void)robot_media_runtime_init_once();
   return 0;
 }
 
@@ -658,6 +1061,7 @@ static int robot_voice_asr_test(void)
   return ret;
 }
 
+
 static int robot_voice_tts_test(const char *text)
 {
   int ret = robot_audio_playback_open();
@@ -709,6 +1113,14 @@ int main(int argc, char *argv[])
       if (ret == 0) printf("LLM: %s\n", reply);
       return ret;
     }
+  if (argc >= 3 && strcmp(argv[1], "music_play") == 0)
+    {
+      return robot_music_play_file(argv[2]);
+    }
+  if (argc >= 3 && strcmp(argv[1], "test_wav") == 0)
+    {
+      return robot_music_play_file(argv[2]);
+    }
   if (argc >= 3 && strcmp(argv[1], "test_tts") == 0)
     {
       if (g_api_key[0] == '\0') { printf("robot_voice: use set_key first\n"); return 1; }
@@ -722,6 +1134,7 @@ int main(int argc, char *argv[])
       return 0;
     }
   printf("Usage: robot_voice set_key <api_key> | once | test_capture | "
-         "test_asr | test_llm <text> | test_tts <text> | diag\n");
+         "test_asr | test_llm <text> | music_play <path> | "
+         "test_wav <path> | test_tts <text> | diag\n");
   return 0;
 }

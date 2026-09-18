@@ -96,6 +96,7 @@ struct lcd_dev_s;
 struct i2s_dev_s *board_voice_mic_i2s(void);
 struct i2s_dev_s *board_voice_speaker_i2s(void);
 void board_voice_mic_set_diagnostics(bool enabled);
+int board_voice_audio_initialize(void);
 int board_oled_initialize(void);
 struct lcd_dev_s *board_oled_getdev(void);
 
