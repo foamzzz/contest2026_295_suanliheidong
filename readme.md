@@ -1,12 +1,12 @@
-# OpenVela ESP32-S3 AI 机器狗
+# openvela ESP32-S3 AI 机器狗
 
 ## 0. 使用、编译与调试
 
-本项目运行于 **OpenVela / NuttX + ESP32-S3**，集成 OpenVela 官方 `ai_agent`、MiMo V2.5 ASR/LLM/TTS、舵机运动、OLED 表情和音频播放。
+本项目运行于 **openvela / NuttX + ESP32-S3**，集成 openvela 官方 `ai_agent`、MiMo V2.5 ASR/LLM/TTS、舵机运动、OLED 表情和音频播放。
 
 ### 0.1 编译
 
-进入 OpenVela 工作区：
+进入 openvela 工作区：
 
 ```bash
 cd /vela/openvela
@@ -167,7 +167,7 @@ mediatool> start 0
 
 # 1. 作品介绍
 
-这是我基于 **OpenVela / NuttX 和 ESP32-S3** 开发的一款 AI 机器狗。
+这是我基于 **openvela / NuttX 和 ESP32-S3** 开发的一款 AI 机器狗。
 
 作品希望把大模型从“会说话”进一步扩展到“能够控制真实机器人”。同一个 Agent 除了完成语音问答，还可以根据上下文和 Skill 调用机器狗的动作、表情和音乐能力。
 
@@ -176,13 +176,13 @@ mediatool> start 0
 - MiMo V2.5 ASR；
 - MiMo V2.5 LLM；
 - MiMo V2.5 TTS；
-- OpenVela 官方 `ai_agent`；
+- openvela 官方 `ai_agent`；
 - 文本与语音交互；
 - 前进、后退、左转、右转；
 - 安全摇尾巴；
 - SSD1306 OLED 表情；
 - `robot_react` 短时情绪反应；
-- 本地 WAV 与 OpenVela Media 播放；
+- 本地 WAV 与 openvela Media 播放；
 - Markdown Skill 自动打包与加载；
 - 饮食推荐、机器人陪伴等自定义 Skill。
 
@@ -203,7 +203,7 @@ robot_voice_capture
     ↓
 MiMo V2.5 ASR
     ↓
-OpenVela ai_agent
+openvela ai_agent
     ↓
 MiMo V2.5 LLM
     ↓
@@ -238,7 +238,7 @@ TTS 和扬声器逻辑播放：
 
 ## 2.2 Agent 框架
 
-本项目直接使用 OpenVela 官方 `ai_agent` 作为统一 Agent 中枢。
+本项目直接使用 openvela 官方 `ai_agent` 作为统一 Agent 中枢。
 
 ```text
 用户输入
@@ -269,7 +269,7 @@ Agent 最终回复
 
 # 3. Agent Tool 设计
 
-项目通过 OpenVela 官方 `tool_registry_register_provider()` 注册机器狗能力。
+项目通过 openvela 官方 `tool_registry_register_provider()` 注册机器狗能力。
 
 | Tool | 功能 | 实现 |
 |---|---|---|
@@ -278,8 +278,8 @@ Agent 最终回复
 | `robot_set_expression` | 设置持续表情 | `robot_expression_tool.c` |
 | `robot_react` | 短时情绪反应 | `robot_expression_tool.c` |
 | `robot_play_music` | 播放本地 WAV | `robot_music_player.c` |
-| `music_search` | 在线搜索音乐 | OpenVela Tool |
-| `music_play` | Media 音乐播放 | OpenVela Tool |
+| `music_search` | 在线搜索音乐 | openvela Tool |
+| `music_play` | Media 音乐播放 | openvela Tool |
 
 实体动作不会把原始 PWM 或任意舵机角度直接交给 LLM，而是提供前进、转向、摇尾等高层动作。运动通过统一 worker 和 `robot_action_guard` 管理。
 
@@ -300,7 +300,7 @@ Tool Executor
     ↓
 Provider 注册
     ↓
-OpenVela Agent
+openvela Agent
 ```
 
 因此后续增加灯光、环境传感器、机械臂或新的运动能力时，只需要新增对应 Tool Provider，不需要重新实现 Agent 主循环。
@@ -384,7 +384,7 @@ I2S1
 MAX98357
 ```
 
-OpenVela Media：
+openvela Media：
 
 ```text
 Media Graph
@@ -423,7 +423,7 @@ contest_skill_bundle.c
   ↓
 robot_skill_installer
   ↓
-OpenVela runtime Skill
+openvela runtime Skill
 ```
 
 Skill 负责行为策略和多轮对话，Tool 负责实际执行：
@@ -571,14 +571,14 @@ contest2026_295_suanliheidong/
 
 # 7. 作品总结
 
-本作品将 OpenVela 官方 Agent 与 ESP32-S3 机器人硬件组合成一套完整链路：
+本作品将 openvela 官方 Agent 与 ESP32-S3 机器人硬件组合成一套完整链路：
 
 ```text
 听
 INMP441 + MiMo V2.5 ASR
         ↓
 想
-OpenVela ai_agent + MiMo V2.5 + Skills
+openvela ai_agent + MiMo V2.5 + Skills
         ↓
 做
 Robot Tools → 动作 / 表情 / 音乐
