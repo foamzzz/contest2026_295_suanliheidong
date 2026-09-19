@@ -10,6 +10,13 @@
 
   <project path="contest2026_295_suanliheidong" name="contest2026_295_suanliheidong">
     <linkfile src="app/hello_app" dest="packages/demos/contest2026_295_hello_app"/>
+<<<<<<< HEAD
+=======
+    <linkfile src="app/robotctl" dest="packages/demos/contest2026_295_robotctl"/>
+    <linkfile src="app/voice_echo" dest="packages/demos/contest2026_295_voice_echo"/>
+    <linkfile src="app/robot_voice" dest="packages/demos/contest2026_295_robot_voice"/>
+    <linkfile src="app/robot_agentctl" dest="packages/demos/contest2026_295_robot_agentctl"/>
+>>>>>>> 5f976fb (feat: improve robot agent interaction and food recommendation)
     <linkfile src="quickapp/hello_quickapp" dest="packages/apps/contest2026_295_hello_quickapp"/>
     <linkfile src="board/contest_board" dest="vendor/openvela/boards/contest2026_295_board"/>
   </project>
