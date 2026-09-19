@@ -52,7 +52,17 @@ snapshot_local_sources()
     fi
 
     archive="${LOCAL_SOURCE_SNAPSHOT}/${rel//\//__}.tar"
-    tar -C "${OPENVELA_ROOT}" --exclude=.git -cpf "${archive}" "${rel}"
+    # Snapshot user-owned source/config only.  Never preserve generated
+    # objects/archives, otherwise restore_local_sources() can resurrect stale
+    # code after a context/clean operation.
+    tar -C "${OPENVELA_ROOT}" \
+      --exclude=.git \
+      --exclude='*.o' \
+      --exclude='*.a' \
+      --exclude='*.d' \
+      --exclude='*.gcno' \
+      --exclude='*.gcda' \
+      -cpf "${archive}" "${rel}"
     printf '%s\n' "${rel}" >> "${LOCAL_SOURCE_SNAPSHOT}/paths"
     found=1
   done
@@ -211,6 +221,34 @@ run_configured_make()
 }
 
 
+is_maintenance_target()
+{
+  local arg
+
+  for arg in "$@"; do
+    case "${arg}" in
+      clean|distclean)
+        return 0
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+
+run_maintenance_target()
+{
+  echo "Maintenance target detected: $*"
+  echo "Skipping context bootstrap and all temporary HAL/NuttX/ai_agent backports."
+  echo "This prevents distclean from deleting patched targets before the EXIT restore trap."
+
+  # Source/config trees are not touched by NuttX clean/distclean.  Invoke the
+  # requested make target directly and do not install the backport trap.
+  run_configured_make "$@"
+}
+
+
 verify_voice_fix_sources()
 {
   if test "${VOICE_FIX_REQUIRED}" != 1; then
@@ -302,40 +340,33 @@ verify_voice_fix_sources()
 
 force_clean_rebuild()
 {
-  # The ai_agent sources live outside nuttx/, and old externally-built object
-  # files can survive a context refresh.  Remove only the known stale MiMo
-  # objects and application archives; do not distclean and do not touch the
-  # board defconfig.
-  echo "Removing stale generated voice/app build artifacts only; source files are untouched..."
+  # ai_agent and contest sources live outside nuttx/.  Clear generated
+  # external objects across the full roots.  Limiting cleanup to voice/
+  # robot_voice/ leaves stale network_manager/robot_network_adapter objects
+  # able to shadow the restored source.
+  echo "Removing stale external ai_agent/contest build artifacts; source files are untouched..."
 
-  find "${OPENVELA_ROOT}/packages/ai_agent/src/voice" \
-    -maxdepth 1 -type f \( \
-      -name 'mimo_voice.c.*.o' -o \
-      -name 'audio_playback.c.*.o' -o \
-      -name 'voice_channel.c.*.o' -o \
-      -name 'voice_tts.c.*.o' -o \
-      -name 'voice_asr.c.*.o' \
+  find "${OPENVELA_ROOT}/packages/ai_agent/src" \
+    -type f \( \
+      -name '*.o' -o \
+      -name '*.c.*.o' -o \
+      -name '*.cc.*.o' -o \
+      -name '*.cpp.*.o' -o \
+      -name '*.d' \
     \) -print -delete 2>/dev/null || true
 
-  # vela_tls.c also lives outside nuttx/ and can leave an external object
-  # behind.  Remove it as well so the streaming transport implementation
-  # cannot be shadowed by a stale object.
-  find "${OPENVELA_ROOT}/packages/ai_agent/src/infra" \
-    -maxdepth 1 -type f \
-    -name 'vela_tls.c.*.o' \
-    -print -delete 2>/dev/null || true
-
-  # robot_voice is also built from outside nuttx/.  Clear stale externally
-  # generated objects so newly-added contest-local sources cannot be hidden by
-  # an old application object/archive list.
-  find "${OPENVELA_ROOT}/contest2026_295_suanliheidong/app/robot_voice" \
-    -maxdepth 1 -type f -name '*.c.*.o' \
-    -print -delete 2>/dev/null || true
+  find "${OPENVELA_ROOT}/contest2026_295_suanliheidong/app" \
+    -type f \( \
+      -name '*.o' -o \
+      -name '*.c.*.o' -o \
+      -name '*.cc.*.o' -o \
+      -name '*.cpp.*.o' -o \
+      -name '*.d' \
+    \) -print -delete 2>/dev/null || true
 
   rm -f \
     "${OPENVELA_ROOT}/apps/libapps.a" \
     "${NUTTX_DIR}/staging/libapps.a"
-
   echo "Forcing clean rebuild so the current local ai_agent sources are compiled exactly as present..."
   make -C "${NUTTX_DIR}" clean
 }
@@ -463,6 +494,14 @@ restore_backports()
 
   exit "${rc}"
 }
+
+# clean/distclean are destructive maintenance operations.  They must not run
+# inside the temporary-backport lifecycle: distclean removes the HAL checkout
+# and generated mbedTLS config, making the EXIT restore helpers impossible.
+if is_maintenance_target "$@"; then
+  run_maintenance_target "$@"
+  exit $?
+fi
 
 # Snapshot user-owned source before any context/bootstrap operation.  This is
 # intentionally outside the compatibility-patch lifecycle: temporary HAL and
