@@ -4,7 +4,7 @@
 
 # 一. 作品介绍
 
-这是我基于 **openvela / NuttX 和 ESP32-S3** 开发的一款 AI 机器狗。
+这是我基于 **openvela 和 ESP32-S3** 开发的一款 AI 机器狗。
 
 作品希望把大模型从“会说话”进一步扩展到“能够控制真实机器人”。同一个 Agent 除了完成语音问答，还可以根据上下文和 Skill 调用机器狗的动作、表情和音乐能力。
 
@@ -27,7 +27,7 @@
 
 # 二. 使用、编译与调试
 
-本项目运行于 **openvela / NuttX + ESP32-S3**，集成 openvela 官方 `ai_agent`、MiMo V2.5 ASR/LLM/TTS、舵机运动、OLED 表情和音频播放。
+本项目运行于 **openvela + ESP32-S3**，集成 openvela 官方 `ai_agent`、MiMo V2.5 ASR/LLM/TTS、舵机运动、OLED 表情和音频播放。
 
 ## 2.1 编译
 
@@ -589,4 +589,4 @@ MiMo V2.5 TTS + MAX98357
 
 Tool Provider 让机器狗的能力能够继续扩展，而 Agent 的对话、推理和上下文框架保持统一。
 
-最终实现的是一套能够在 ESP32-S3 上完成 **语音理解、Agent 推理、实体动作、表情反馈和语音输出** 的嵌入式 AI 机器狗。
+最终实现的是一套使用openvela系统，能够在 ESP32-S3 上完成 **语音理解、Agent 推理、实体动作、表情反馈和语音输出** 的嵌入式 AI 机器狗。
