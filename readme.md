@@ -1,10 +1,35 @@
 # openvela ESP32-S3 AI 机器狗
 
-## 0. 使用、编译与调试
+---
+
+# 一. 作品介绍
+
+这是我基于 **openvela / NuttX 和 ESP32-S3** 开发的一款 AI 机器狗。
+
+作品希望把大模型从“会说话”进一步扩展到“能够控制真实机器人”。同一个 Agent 除了完成语音问答，还可以根据上下文和 Skill 调用机器狗的动作、表情和音乐能力。
+
+当前作品实现：
+
+- MiMo V2.5 ASR；
+- MiMo V2.5 LLM；
+- MiMo V2.5 TTS；
+- openvela 官方 `ai_agent`；
+- 文本与语音交互；
+- 前进、后退、左转、右转；
+- 安全摇尾巴；
+- SSD1306 OLED 表情；
+- `robot_react` 短时情绪反应；
+- 本地 WAV 与 openvela Media 播放；
+- Markdown Skill 自动打包与加载；
+- 饮食推荐、机器人陪伴等自定义 Skill。
+
+---
+
+# 二. 使用、编译与调试
 
 本项目运行于 **openvela / NuttX + ESP32-S3**，集成 openvela 官方 `ai_agent`、MiMo V2.5 ASR/LLM/TTS、舵机运动、OLED 表情和音频播放。
 
-### 0.1 编译
+## 2.1 编译
 
 进入 openvela 工作区：
 
@@ -47,7 +72,7 @@ nuttx/nuttx.bin
 contest2026_295_suanliheidong/board/contest_board/scripts/build_with_hal_backport.sh distclean -j8
 ```
 
-### 0.2 烧录
+## 2.2 烧录
 
 ```bash
 PORT=/dev/ttyUSB0
@@ -77,7 +102,7 @@ python -m esptool \
   nuttx/nuttx.bin
 ```
 
-### 0.3 启动与首次配置
+## 2.3 启动与首次配置
 
 烧录完成后松开 BOOT/GPIO0，按 EN/RESET，板卡进入下载模式，打开串口：
 
@@ -115,9 +140,7 @@ vela> voice_start
 vela> voice_stop
 ```
 
-> 不要将真实 API Key 提交到源码或 Git 记录中。
-
-### 0.4 调试命令
+## 2.4 调试命令
 
 网络与 Agent：
 
@@ -163,34 +186,11 @@ mediatool> start 0
 | `[C-I2S]` | I2S |
 | `[media]` | Media |
 
----
 
-# 1. 作品介绍
 
-这是我基于 **openvela / NuttX 和 ESP32-S3** 开发的一款 AI 机器狗。
+# 三. 系统实现框架
 
-作品希望把大模型从“会说话”进一步扩展到“能够控制真实机器人”。同一个 Agent 除了完成语音问答，还可以根据上下文和 Skill 调用机器狗的动作、表情和音乐能力。
-
-当前作品实现：
-
-- MiMo V2.5 ASR；
-- MiMo V2.5 LLM；
-- MiMo V2.5 TTS；
-- openvela 官方 `ai_agent`；
-- 文本与语音交互；
-- 前进、后退、左转、右转；
-- 安全摇尾巴；
-- SSD1306 OLED 表情；
-- `robot_react` 短时情绪反应；
-- 本地 WAV 与 openvela Media 播放；
-- Markdown Skill 自动打包与加载；
-- 饮食推荐、机器人陪伴等自定义 Skill。
-
----
-
-# 2. 系统实现框架
-
-## 2.1 完整语音链路
+## 3.1 完整语音链路
 
 机器狗的语音交互链路为：
 
@@ -236,7 +236,7 @@ TTS 和扬声器逻辑播放：
 
 `vela ask` 文本输入直接进入同一套 Agent，因此文本和语音最终共用同一个 LLM、Skill、Tool 和回复链路。
 
-## 2.2 Agent 框架
+## 3.2 Agent 框架
 
 本项目直接使用 openvela 官方 `ai_agent` 作为统一 Agent 中枢。
 
@@ -267,7 +267,7 @@ Agent 最终回复
 
 ---
 
-# 3. Agent Tool 设计
+# 四. Agent Tool 设计
 
 项目通过 openvela 官方 `tool_registry_register_provider()` 注册机器狗能力。
 
@@ -283,7 +283,7 @@ Agent 最终回复
 
 实体动作不会把原始 PWM 或任意舵机角度直接交给 LLM，而是提供前进、转向、摇尾等高层动作。运动通过统一 worker 和 `robot_action_guard` 管理。
 
-## 3.1 Tool 可扩展框架
+## 4.1 Tool 可扩展框架
 
 一个新的机器人能力可以按照统一模式接入：
 
@@ -307,9 +307,9 @@ openvela Agent
 
 ---
 
-# 4. 当前机器人能力
+# 五. 当前机器人能力
 
-## 4.1 OLED 表情
+## 5.1 OLED 表情
 
 使用 **SSD1306 128×64 OLED** 作为机器狗的“脸”。
 
@@ -338,7 +338,7 @@ SSD1306
 
 `robot_set_expression` 用于持续表情，`robot_react` 用于短时情绪反馈。语音过程中也会跟随 listening、thinking、speaking 等状态切换。
 
-## 4.2 运动与尾巴
+## 5.2 运动与尾巴
 
 机器狗使用 5 路舵机：
 
@@ -368,7 +368,7 @@ LEDC PWM
 舵机
 ```
 
-## 4.3 音乐与音频
+## 5.3 音乐与音频
 
 本地 WAV：
 
@@ -404,7 +404,7 @@ MAX98357
 /etc/media/test.wav
 ```
 
-## 4.4 Skills
+## 5.4 Skills
 
 自定义 Skill 位于：
 
@@ -435,9 +435,9 @@ Tool ：告诉 Agent 可以做什么
 
 ---
 
-# 5. 硬件与引脚
+# 六. 硬件与引脚
 
-## 5.1 硬件配置
+## 6.1 硬件配置
 
 | 模块 | 配置 |
 |---|---|
@@ -452,7 +452,7 @@ Tool ：告诉 Agent 可以做什么
 | 舵机接口 | LEDC PWM，50 Hz |
 | Media Audio | `/dev/audio/pcm0p` |
 
-## 5.2 实际引脚分配
+## 6.2 实际引脚分配
 
 | 模组 Pin | GPIO / 信号 | 程序宏 | 实际用途 | 模式 | 程序中的行为 |
 |---:|---|---|---|---|---|
@@ -500,9 +500,9 @@ GPIO48 -> 尾巴
 
 ---
 
-# 6. 主要文件职责
+# 七. 主要文件职责
 
-## 6.1 语音与音频
+## 7.1 语音与音频
 
 | 文件 | 作用 |
 |---|---|
@@ -516,7 +516,7 @@ GPIO48 -> 尾巴
 | `app/robot_voice/robot_music_player.c/.h` | 本地 WAV Tool |
 | `app/robot_voice/robot_voice_config.h` | 语音参数 |
 
-## 6.2 运动与表情
+## 7.2 运动与表情
 
 | 文件 | 作用 |
 |---|---|
@@ -529,7 +529,7 @@ GPIO48 -> 尾巴
 | `app/robot_expression/robot_oled.c/.h` | OLED worker |
 | `app/robot_expression/robot_oled_expr.c/.h` | 表情帧绘制 |
 
-## 6.3 Agent、Skill 与板级
+## 7.3 Agent、Skill 与板级
 
 | 文件 | 作用 |
 |---|---|
@@ -569,7 +569,7 @@ contest2026_295_suanliheidong/
 
 ---
 
-# 7. 作品总结
+# 八. 作品总结
 
 本作品将 openvela 官方 Agent 与 ESP32-S3 机器人硬件组合成一套完整链路：
 
