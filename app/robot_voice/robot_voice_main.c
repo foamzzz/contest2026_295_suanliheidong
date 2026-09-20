@@ -33,6 +33,18 @@
 
 #define ROBOT_MEDIA_STARTUP_GRACE_US       (1500 * 1000)
 
+/*
+ * Keep the board's configured capture window as the baseline, but give
+ * voice_start three additional seconds before submitting the PCM to ASR.
+ * This is intentionally contest-local so the official voice configuration
+ * file does not need to be changed.
+ */
+#ifndef CONTEST_VOICE_CAPTURE_EXTRA_SECONDS
+#  define CONTEST_VOICE_CAPTURE_EXTRA_SECONDS 3
+#endif
+#define CONTEST_VOICE_CAPTURE_SECONDS \
+  (ROBOT_VOICE_CAPTURE_SECONDS + CONTEST_VOICE_CAPTURE_EXTRA_SECONDS)
+
 static bool g_robot_media_initialized;
 static pthread_mutex_t g_robot_media_init_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -679,7 +691,7 @@ static bool robot_voice_rewrite_local_music_request(const char *text,
 static void *voice_record_worker(void *arg)
 {
   size_t pcm_cap = (size_t)ROBOT_VOICE_CAPTURE_RATE * 2 *
-                   ROBOT_VOICE_CAPTURE_SECONDS;
+                   CONTEST_VOICE_CAPTURE_SECONDS;
   uint8_t *pcm = malloc(pcm_cap);
   char text[512];
   char routed_text[512];
@@ -700,7 +712,7 @@ static void *voice_record_worker(void *arg)
       (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_VOICE,
                                   ROBOT_EXPRESSION_LISTENING, 0);
       ret = robot_voice_capture_record_interruptible(
-          pcm, pcm_cap, &pcm_len, ROBOT_VOICE_CAPTURE_SECONDS * 1000,
+          pcm, pcm_cap, &pcm_len, CONTEST_VOICE_CAPTURE_SECONDS * 1000,
           &g_voice_stop_requested);
       printf("[RV-VOICE] capture returned rc=%d bytes=%zu\n", ret, pcm_len);
       if (ret < 0 || g_voice_stop_requested)
@@ -1487,13 +1499,13 @@ static int robot_voice_once(void)
 
 static int robot_voice_capture_test(void)
 {
-  size_t cap = ROBOT_VOICE_CAPTURE_RATE * 2 * ROBOT_VOICE_CAPTURE_SECONDS;
+  size_t cap = ROBOT_VOICE_CAPTURE_RATE * 2 * CONTEST_VOICE_CAPTURE_SECONDS;
   uint8_t *pcm = malloc(cap);
   size_t len = 0;
   int ret;
   if (!pcm) return -ENOMEM;
   ret = robot_voice_capture_record(pcm, cap, &len,
-                                   ROBOT_VOICE_CAPTURE_SECONDS * 1000);
+                                   CONTEST_VOICE_CAPTURE_SECONDS * 1000);
   printf("[RV-CAP] test rc=%d bytes=%zu\n", ret, len);
   free(pcm);
   return ret;
@@ -1501,14 +1513,14 @@ static int robot_voice_capture_test(void)
 
 static int robot_voice_asr_test(void)
 {
-  size_t cap = ROBOT_VOICE_CAPTURE_RATE * 2 * ROBOT_VOICE_CAPTURE_SECONDS;
+  size_t cap = ROBOT_VOICE_CAPTURE_RATE * 2 * CONTEST_VOICE_CAPTURE_SECONDS;
   uint8_t *pcm = malloc(cap);
   char text[512];
   size_t len = 0;
   int ret;
   if (!pcm) return -ENOMEM;
   ret = robot_voice_capture_record(pcm, cap, &len,
-                                   ROBOT_VOICE_CAPTURE_SECONDS * 1000);
+                                   CONTEST_VOICE_CAPTURE_SECONDS * 1000);
   if (ret == 0) ret = contest_voice_run_asr(pcm, len, text, sizeof(text));
   if (ret == 0) printf("ASR: %s\n", text);
   free(pcm);

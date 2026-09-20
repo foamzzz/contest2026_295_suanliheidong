@@ -39,7 +39,7 @@
 #define ROBOT_VOICE_RX_WARMUP_CHUNKS    2
 #define ROBOT_VOICE_RX_POLL_MS          50
 #define ROBOT_VOICE_RX_TIMEOUT_MS       1000
-#define ROBOT_VOICE_RECORD_TIMEOUT_MS   7000
+#define ROBOT_VOICE_RECORD_GUARD_MS     2000
 
 struct robot_voice_transfer_s
 {
@@ -475,7 +475,11 @@ int robot_voice_capture_record_interruptible(
 
   capture_target = target + ROBOT_VOICE_RX_WARMUP_CHUNKS *
                              ROBOT_VOICE_RX_DMA_BYTES;
-  deadline = clock_systime_ticks() + MSEC2TICK(ROBOT_VOICE_RECORD_TIMEOUT_MS);
+  /* Allow the requested capture window to grow without being cut off by a
+   * stale fixed seven-second deadline.  The guard covers the RX queue,
+   * callback and final APB completion overhead. */
+  deadline = clock_systime_ticks() +
+             MSEC2TICK(duration_ms + ROBOT_VOICE_RECORD_GUARD_MS);
 
   printf("[RV-CAP] recording %u ms target=%zu chunk=%d slots=%d warmup=%d\n",
          duration_ms, target, ROBOT_VOICE_RX_DMA_BYTES,

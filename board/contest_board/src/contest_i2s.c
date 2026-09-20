@@ -71,7 +71,7 @@
 #define CONTEST_I2S_SOURCE_CLOCK        160000000UL
 #define CONTEST_I2S_MCLK_MULTIPLE       256
 #define CONTEST_I2S_DMA_DESC_COUNT      CONFIG_I2S_DMADESC_NUM
-#define CONTEST_I2S_TX_RING_SLOTS        10
+#define CONTEST_I2S_TX_RING_SLOTS        16
 #define CONTEST_I2S_TX_SLOT_BYTES        2048
 #define CONTEST_I2S_TX_DMA_ALIGN         32
 /* Each immutable descriptor reads a private DMA block allocated only during

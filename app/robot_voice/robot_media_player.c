@@ -73,6 +73,26 @@ struct rv_media_player
   void *callback_cookie;
 };
 
+/* Track the currently active official Media player so contest voice control
+ * can stop online/Media playback without owning tool_media's private handle. */
+static pthread_mutex_t g_rv_active_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct rv_media_player *g_rv_active_player;
+
+static bool rv_player_stop_requested(struct rv_media_player *player)
+{
+  bool stop = false;
+
+  if (player == NULL)
+    {
+      return true;
+    }
+
+  pthread_mutex_lock(&player->lock);
+  stop = player->stop_requested;
+  pthread_mutex_unlock(&player->lock);
+  return stop;
+}
+
 static void *rv_event_worker(void *arg)
 {
   struct rv_media_event *event = arg;
@@ -141,6 +161,7 @@ static void rv_emit_event(struct rv_media_player *player, int event,
 struct rv_mp3_decoder
 {
   HMP3Decoder decoder;
+  struct rv_media_player *player;
   unsigned char input[RV_MP3_INPUT_CAP];
   size_t input_len;
   int phase;
@@ -297,16 +318,28 @@ static int rv_mp3_sink(char **buffer, int offset, int datend, int *buflen,
                        void *arg)
 {
   struct rv_mp3_decoder *decoder = arg;
+  int ret;
 
-  (void)buffer;
   (void)buflen;
-  if (!decoder || offset < 0 || datend < offset)
+  if (!decoder || !buffer || !*buffer || offset < 0 || datend < offset)
     {
       return -EINVAL;
     }
 
-  return rv_mp3_decode(decoder, (const unsigned char *)*buffer + offset,
-                       (size_t)(datend - offset));
+  if (rv_player_stop_requested(decoder->player))
+    {
+      syslog(LOG_INFO, "[%s] HTTP MP3 stop observed in sink\n", RV_MEDIA_TAG);
+      return -ECANCELED;
+    }
+
+  ret = rv_mp3_decode(decoder, (const unsigned char *)*buffer + offset,
+                      (size_t)(datend - offset));
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  return rv_player_stop_requested(decoder->player) ? -ECANCELED : 0;
 }
 #endif
 
@@ -365,6 +398,8 @@ static void *rv_url_worker(void *arg)
       goto decoder_cleanup;
     }
 
+  decoder->player = player;
+
   webclient_set_defaults(&context);
   context.url = player->url;
   context.buffer = http_buffer;
@@ -376,7 +411,12 @@ static void *rv_url_worker(void *arg)
   syslog(LOG_INFO, "[%s] HTTP MP3 begin url=%s\n", RV_MEDIA_TAG,
          player->url);
   result = webclient_perform(&context);
-  if (result == 0 && context.http_status >= 300)
+  if (rv_player_stop_requested(player))
+    {
+      /* A sink-side -ECANCELED is an expected user stop, not playback failure. */
+      result = 0;
+    }
+  else if (result == 0 && context.http_status >= 300)
     {
       result = -EIO;
     }
@@ -395,13 +435,18 @@ decoder_cleanup:
   result = -ENOSYS;
 #endif
 
+  bool stopped = rv_player_stop_requested(player);
+
   pthread_mutex_lock(&player->lock);
   bool playback_open = player->playback_open;
   player->playback_open = false;
   pthread_mutex_unlock(&player->lock);
   if (playback_open)
     {
-      robot_audio_playback_finish();
+      if (!stopped)
+        {
+          robot_audio_playback_finish();
+        }
       robot_audio_playback_close();
     }
 
@@ -409,9 +454,16 @@ decoder_cleanup:
   player->worker_done = true;
   pthread_mutex_unlock(&player->lock);
 
-  syslog(result == 0 ? LOG_INFO : LOG_ERR,
-         "[%s] HTTP MP3 complete rc=%d\n", RV_MEDIA_TAG, result);
-  rv_emit_event(player, RV_EVENT_COMPLETED, result);
+  if (stopped)
+    {
+      syslog(LOG_INFO, "[%s] HTTP MP3 stopped by request\n", RV_MEDIA_TAG);
+    }
+  else
+    {
+      syslog(result == 0 ? LOG_INFO : LOG_ERR,
+             "[%s] HTTP MP3 complete rc=%d\n", RV_MEDIA_TAG, result);
+      rv_emit_event(player, RV_EVENT_COMPLETED, result);
+    }
   return NULL;
 }
 
@@ -436,11 +488,13 @@ void *media_player_open(const char *stream)
   return player;
 }
 
+static int rv_media_player_stop_internal(struct rv_media_player *player);
 int media_player_stop(void *handle);
 
 int media_player_close(void *handle, int pending_stop)
 {
   struct rv_media_player *player = handle;
+  int ret;
 
   (void)pending_stop;
   if (!player)
@@ -448,10 +502,21 @@ int media_player_close(void *handle, int pending_stop)
       return -EINVAL;
     }
 
-  (void)media_player_stop(player);
+  /*
+   * Serialize close/free with voice-side active-player stop.  The global lock
+   * protects the borrowed active handle from becoming a dangling pointer.
+   */
+  pthread_mutex_lock(&g_rv_active_lock);
+  if (g_rv_active_player == player)
+    {
+      g_rv_active_player = NULL;
+    }
+
+  ret = rv_media_player_stop_internal(player);
   pthread_mutex_destroy(&player->lock);
   free(player);
-  return 0;
+  pthread_mutex_unlock(&g_rv_active_lock);
+  return ret;
 }
 
 int media_player_set_event_callback(void *handle, void *cookie,
@@ -539,6 +604,8 @@ int media_player_start(void *handle)
       return -EINVAL;
     }
   player->started = true;
+  player->stop_requested = false;
+  player->worker_done = false;
   player->playback_open = false;
   pthread_mutex_unlock(&player->lock);
 
@@ -578,15 +645,18 @@ int media_player_start(void *handle)
     }
   pthread_mutex_unlock(&player->lock);
 
+  pthread_mutex_lock(&g_rv_active_lock);
+  g_rv_active_player = player;
+  pthread_mutex_unlock(&g_rv_active_lock);
+
   syslog(LOG_INFO, "[%s] started mode=%s\n", RV_MEDIA_TAG,
          player->url_mode ? "url" : "pcm");
   rv_emit_event(player, RV_EVENT_STARTED, 0);
   return 0;
 }
 
-int media_player_stop(void *handle)
+static int rv_media_player_stop_internal(struct rv_media_player *player)
 {
-  struct rv_media_player *player = handle;
   pthread_t worker;
   bool join_worker;
   bool playback_open;
@@ -611,15 +681,37 @@ int media_player_stop(void *handle)
   pthread_mutex_lock(&player->lock);
   playback_open = player->playback_open;
   player->playback_open = false;
+  player->started = false;
   pthread_mutex_unlock(&player->lock);
+
   if (playback_open)
     {
-      robot_audio_playback_finish();
+      /* User stop should be immediate: do not drain queued music first. */
       robot_audio_playback_close();
     }
 
   rv_emit_event(player, RV_EVENT_STOPPED, 0);
   return 0;
+}
+
+int media_player_stop(void *handle)
+{
+  struct rv_media_player *player = handle;
+  int ret;
+
+  if (!player)
+    {
+      return -EINVAL;
+    }
+
+  pthread_mutex_lock(&g_rv_active_lock);
+  if (g_rv_active_player == player)
+    {
+      g_rv_active_player = NULL;
+    }
+  ret = rv_media_player_stop_internal(player);
+  pthread_mutex_unlock(&g_rv_active_lock);
+  return ret;
 }
 
 static int rv_write_scaled_pcm16(const void *data, size_t len)
@@ -700,6 +792,32 @@ ssize_t media_player_write_data(void *handle, const void *data, size_t len)
   pthread_mutex_unlock(&player->lock);
 
   return rv_write_scaled_pcm16(data, len);
+}
+
+/* Contest-local bridge used by robot_stop_music / voice fast path.
+ * Holding g_rv_active_lock across media_player_stop() prevents close/free from
+ * racing the borrowed active handle. */
+int robot_media_stop_active(void)
+{
+  struct rv_media_player *player;
+  int ret = 0;
+
+  /*
+   * Hold the active-player lock through the internal stop.  media_player_close()
+   * uses the same lock, so the handle cannot be freed underneath this call.
+   */
+  pthread_mutex_lock(&g_rv_active_lock);
+  player = g_rv_active_player;
+  if (player != NULL)
+    {
+      g_rv_active_player = NULL;
+      ret = rv_media_player_stop_internal(player);
+    }
+  pthread_mutex_unlock(&g_rv_active_lock);
+
+  syslog(LOG_INFO, "[%s] voice stop active=%s rc=%d\n",
+         RV_MEDIA_TAG, player ? "yes" : "no", ret);
+  return ret;
 }
 
 int media_player_pause(void *handle)

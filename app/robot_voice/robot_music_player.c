@@ -23,6 +23,7 @@
 #define ROBOT_MUSIC_READ_BYTES       1024
 
 #define ROBOT_MUSIC_TOOL_NAME        "robot_play_music"
+#define ROBOT_MUSIC_STOP_TOOL_NAME   "robot_stop_music"
 #define ROBOT_MUSIC_DEFAULT_PATH     "/etc/media/test.wav"
 #define ROBOT_MUSIC_PATH_MAX         256
 #define ROBOT_MUSIC_WORKER_STACK     (16 * 1024)
@@ -37,10 +38,25 @@ struct robot_music_job_s
 };
 
 static pthread_mutex_t g_robot_music_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_robot_music_cond = PTHREAD_COND_INITIALIZER;
 static bool g_robot_music_active;
+static bool g_robot_music_stop_requested;
 static bool g_robot_music_tool_registered;
 static char g_robot_music_path[ROBOT_MUSIC_PATH_MAX];
 static int g_robot_music_last_result;
+
+/* robot_media_player.c provides this when the official Media path is linked. */
+extern int robot_media_stop_active(void) __attribute__((weak));
+
+static bool robot_music_stop_requested(void)
+{
+  bool stop;
+
+  pthread_mutex_lock(&g_robot_music_lock);
+  stop = g_robot_music_stop_requested;
+  pthread_mutex_unlock(&g_robot_music_lock);
+  return stop;
+}
 
 static void robot_music_scale_pcm16_half(uint8_t *buf, size_t len)
 {
@@ -317,8 +333,17 @@ int robot_music_play_file(const char *path)
 
     while (remaining > 0)
       {
-        size_t want = remaining < sizeof(pcm) ? (size_t)remaining : sizeof(pcm);
-        ssize_t nread = read(fd, pcm, want);
+        size_t want;
+        ssize_t nread;
+
+        if (robot_music_stop_requested())
+          {
+            printf("[ROBOT-MUSIC] stop observed before next PCM chunk\n");
+            break;
+          }
+
+        want = remaining < sizeof(pcm) ? (size_t)remaining : sizeof(pcm);
+        nread = read(fd, pcm, want);
 
         if (nread < 0)
           {
@@ -359,13 +384,19 @@ int robot_music_play_file(const char *path)
       }
   }
 
-  if (ret == 0)
+  if (ret == 0 && !robot_music_stop_requested())
     {
       ret = robot_audio_playback_finish();
       if (ret < 0)
         {
           printf("[ROBOT-MUSIC] playback finish failed rc=%d\n", ret);
         }
+    }
+  else if (robot_music_stop_requested())
+    {
+      /* Immediate user stop: close playback without draining queued music. */
+      printf("[ROBOT-MUSIC] playback stopped by request\n");
+      ret = 0;
     }
 
   printf("[ROBOT-MUSIC] playback done rc=%d\n", ret);
@@ -415,7 +446,9 @@ static void *robot_music_worker(void *arg)
   pthread_mutex_lock(&g_robot_music_lock);
   g_robot_music_last_result = ret;
   g_robot_music_active = false;
+  g_robot_music_stop_requested = false;
   g_robot_music_path[0] = '\0';
+  pthread_cond_broadcast(&g_robot_music_cond);
   pthread_mutex_unlock(&g_robot_music_lock);
 
   printf("[ROBOT-MUSIC] worker done rc=%d\n", ret);
@@ -423,56 +456,88 @@ static void *robot_music_worker(void *arg)
   return NULL;
 }
 
+int robot_music_stop(void)
+{
+  bool local_active;
+  int media_ret = 0;
+  int wait_loops = 0;
+
+  pthread_mutex_lock(&g_robot_music_lock);
+  local_active = g_robot_music_active;
+  if (local_active)
+    {
+      g_robot_music_stop_requested = true;
+      printf("[ROBOT-MUSIC] stop requested path=%s\n", g_robot_music_path);
+    }
+  pthread_mutex_unlock(&g_robot_music_lock);
+
+  /* Stop official/online Media playback too, when that compatibility layer
+   * is linked. This makes one voice command stop either music backend. */
+  if (robot_media_stop_active != NULL)
+    {
+      media_ret = robot_media_stop_active();
+    }
+
+  /* Wait briefly until local worker closes robot_audio_playback, otherwise
+   * immediate confirmation TTS can race the still-owned speaker device. */
+  while (local_active)
+    {
+      pthread_mutex_lock(&g_robot_music_lock);
+      local_active = g_robot_music_active;
+      pthread_mutex_unlock(&g_robot_music_lock);
+
+      if (!local_active)
+        {
+          break;
+        }
+
+      if (++wait_loops >= 100) /* 100 * 20 ms = 2 s */
+        {
+          printf("[ROBOT-MUSIC] stop wait timeout; worker still active\n");
+          return -ETIMEDOUT;
+        }
+
+      usleep(20 * 1000);
+    }
+
+  printf("[ROBOT-MUSIC] stop complete media_rc=%d\n", media_ret);
+  return media_ret < 0 ? media_ret : 0;
+}
+
 static char *robot_music_tool_get_tools(void)
 {
-  cJSON *tools = NULL;
-  cJSON *tool = NULL;
-  cJSON *schema = NULL;
-  cJSON *properties = NULL;
-  cJSON *path = NULL;
-  char *json = NULL;
+  cJSON *tools = cJSON_CreateArray();
+  cJSON *play = NULL;
+  cJSON *stop = NULL;
+  char *json;
 
-  tools = cJSON_CreateArray();
-  tool = cJSON_CreateObject();
-  schema = cJSON_CreateObject();
-  properties = cJSON_CreateObject();
-  path = cJSON_CreateObject();
-
-  if (tools == NULL || tool == NULL || schema == NULL ||
-      properties == NULL || path == NULL)
+  if (tools == NULL)
     {
-      cJSON_Delete(tools);
-      cJSON_Delete(tool);
-      cJSON_Delete(schema);
-      cJSON_Delete(properties);
-      cJSON_Delete(path);
       return NULL;
     }
 
-  cJSON_AddStringToObject(tool, "name", ROBOT_MUSIC_TOOL_NAME);
-  cJSON_AddStringToObject(
-      tool, "description",
-      "Play this robot's local or bundled WAV music through the proven "
-      "robot voice speaker path. Use this instead of the official music_play "
-      "tool for local playback on this board. Currently supports PCM16LE, "
-      "24000 Hz, mono WAV. If path is omitted, plays /etc/media/test.wav.");
+  play = cJSON_Parse(
+    "{\"name\":\"robot_play_music\","
+    "\"description\":\"Play local bundled WAV music on this robot.\","
+    "\"input_schema\":{\"type\":\"object\",\"properties\":{"
+    "\"path\":{\"type\":\"string\",\"default\":\"/etc/media/test.wav\"}},"
+    "\"required\":[]}}");
 
-  cJSON_AddStringToObject(schema, "type", "object");
-  cJSON_AddStringToObject(path, "type", "string");
-  cJSON_AddStringToObject(
-      path, "description",
-      "Absolute local WAV path. Current format must be PCM16LE/24000Hz/mono. "
-      "Default: /etc/media/test.wav.");
-  cJSON_AddStringToObject(path, "default", ROBOT_MUSIC_DEFAULT_PATH);
-  cJSON_AddItemToObject(properties, "path", path);
-  path = NULL;
-  cJSON_AddItemToObject(schema, "properties", properties);
-  properties = NULL;
-  cJSON_AddItemToObject(schema, "required", cJSON_CreateArray());
-  cJSON_AddItemToObject(tool, "input_schema", schema);
-  schema = NULL;
-  cJSON_AddItemToArray(tools, tool);
-  tool = NULL;
+  stop = cJSON_Parse(
+    "{\"name\":\"robot_stop_music\","
+    "\"description\":\"Stop any currently playing robot music immediately.\","
+    "\"input_schema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}");
+
+  if (play == NULL || stop == NULL)
+    {
+      cJSON_Delete(play);
+      cJSON_Delete(stop);
+      cJSON_Delete(tools);
+      return NULL;
+    }
+
+  cJSON_AddItemToArray(tools, play);
+  cJSON_AddItemToArray(tools, stop);
 
   json = cJSON_PrintUnformatted(tools);
   cJSON_Delete(tools);
@@ -493,12 +558,28 @@ static int robot_music_tool_execute(const char *name,
   int fd;
   int ret;
 
-  if (name == NULL || strcmp(name, ROBOT_MUSIC_TOOL_NAME) != 0)
+  if (name == NULL)
     {
       return ERROR;
     }
 
   if (output == NULL || output_size == 0)
+    {
+      return ERROR;
+    }
+
+  if (strcmp(name, ROBOT_MUSIC_STOP_TOOL_NAME) == 0)
+    {
+      ret = robot_music_stop();
+      snprintf(output, output_size,
+               ret == 0 ?
+               "{\"ok\":true,\"state\":\"STOPPED\"}" :
+               "{\"ok\":false,\"state\":\"STOP_ERROR\",\"rc\":%d}",
+               ret);
+      return ret == 0 ? OK : ERROR;
+    }
+
+  if (strcmp(name, ROBOT_MUSIC_TOOL_NAME) != 0)
     {
       return ERROR;
     }
@@ -585,6 +666,7 @@ static int robot_music_tool_execute(const char *name,
 
   snprintf(job->path, sizeof(job->path), "%s", path);
   snprintf(g_robot_music_path, sizeof(g_robot_music_path), "%s", path);
+  g_robot_music_stop_requested = false;
   g_robot_music_active = true;
   g_robot_music_last_result = 0;
   pthread_mutex_unlock(&g_robot_music_lock);
