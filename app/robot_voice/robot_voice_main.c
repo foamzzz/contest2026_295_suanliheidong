@@ -13,6 +13,7 @@
 #include "agent_config.h"
 #include "core/message_bus.h"
 #include "core/message_bus_tap.h"
+#include "core/session_mgr.h"
 #include "infra/config_store.h"
 #include "infra/network_manager.h"
 #include "mimo_asr.h"
@@ -123,6 +124,14 @@ static pthread_mutex_t g_voice_speak_lock = PTHREAD_MUTEX_INITIALIZER;
 #define CONTEST_VOICE_ASR_STACK     (24 * 1024)
 #define CONTEST_CLI_TTS_STACK       (16 * 1024)
 #define CONTEST_CLI_TTS_MOTION_WAIT_MS 15000
+
+/* TTS software gain.
+ * MiMo TTS returns signed 16-bit PCM. 1/2 amplitude is about -6.02 dB.
+ * This changes spoken/TTS output only; music may use a separate playback path.
+ */
+#define ROBOT_VOICE_TTS_GAIN_NUM 1
+#define ROBOT_VOICE_TTS_GAIN_DEN 2
+#define ROBOT_VOICE_TTS_SCALE_CHUNK 512
 static volatile int g_voice_running;
 static volatile int g_voice_speaking;
 static volatile int g_voice_oneshot;
@@ -133,6 +142,19 @@ static volatile bool g_voice_worker_exited;
 static pthread_t g_voice_thread;
 static int robot_voice_pcm_sink(const uint8_t *pcm, size_t len, void *arg);
 static int robot_voice_cli_tts_submit(const char *text);
+int voice_channel_speak(const char *text);
+
+/*
+ * Demo latency policy:
+ *   1 = deterministic single-action voice commands execute locally.
+ *   0 = deterministic single-action voice commands still go through MiMo,
+ *       but use a stateless short prompt on chat_id "voice_action".
+ *
+ * Complex / compound commands always go through the official ai_agent.
+ */
+#ifndef ROBOT_VOICE_LOCAL_ACTION_FAST_PATH
+#  define ROBOT_VOICE_LOCAL_ACTION_FAST_PATH 1
+#endif
 static bool g_cli_tap_registered;
 extern pthread_mutex_t g_stdout_lock;
 
@@ -427,6 +449,167 @@ static void contest_voice_wait_for_reply_cycle(void)
 }
 
 
+enum robot_voice_simple_action_e
+{
+  ROBOT_VOICE_ACTION_NONE = 0,
+  ROBOT_VOICE_ACTION_TAIL_WAG,
+  ROBOT_VOICE_ACTION_FORWARD,
+  ROBOT_VOICE_ACTION_BACKWARD,
+  ROBOT_VOICE_ACTION_LEFT,
+  ROBOT_VOICE_ACTION_RIGHT,
+  ROBOT_VOICE_ACTION_HAPPY,
+};
+
+static bool robot_voice_has_any(const char *text,
+                                const char *const *keywords)
+{
+  unsigned int i;
+
+  if (text == NULL || keywords == NULL)
+    {
+      return false;
+    }
+
+  for (i = 0; keywords[i] != NULL; i++)
+    {
+      if (strstr(text, keywords[i]) != NULL)
+        {
+          return true;
+        }
+    }
+
+  return false;
+}
+
+/*
+ * Only classify short, single-action commands here.
+ * Compound requests intentionally fall back to MiMo so the Agent can plan.
+ */
+static enum robot_voice_simple_action_e
+robot_voice_classify_simple_action(const char *text)
+{
+  static const char *const tail_kw[] =
+  {
+    "摇尾巴", "摇一摇尾巴", "摇摇尾巴", "摆尾巴", NULL
+  };
+  static const char *const forward_kw[] =
+  {
+    "向前走", "往前走", "前进一步", "前进", NULL
+  };
+  static const char *const backward_kw[] =
+  {
+    "向后走", "往后走", "后退一步", "后退", NULL
+  };
+  static const char *const left_kw[] =
+  {
+    "向左转", "往左转", "左转", NULL
+  };
+  static const char *const right_kw[] =
+  {
+    "向右转", "往右转", "右转", NULL
+  };
+  static const char *const happy_kw[] =
+  {
+    "开心一点", "开心表情", "做个开心", "笑一个", NULL
+  };
+  bool matched[6];
+  int count = 0;
+  int selected = -1;
+  int i;
+
+  if (text == NULL || text[0] == '\0' || strlen(text) > 96)
+    {
+      return ROBOT_VOICE_ACTION_NONE;
+    }
+
+  matched[0] = robot_voice_has_any(text, tail_kw);
+  matched[1] = robot_voice_has_any(text, forward_kw);
+  matched[2] = robot_voice_has_any(text, backward_kw);
+  matched[3] = robot_voice_has_any(text, left_kw);
+  matched[4] = robot_voice_has_any(text, right_kw);
+  matched[5] = robot_voice_has_any(text, happy_kw);
+
+  for (i = 0; i < 6; i++)
+    {
+      if (matched[i])
+        {
+          count++;
+          selected = i;
+        }
+    }
+
+  /* More than one action family = compound request -> MiMo. */
+  if (count != 1)
+    {
+      return ROBOT_VOICE_ACTION_NONE;
+    }
+
+  return (enum robot_voice_simple_action_e)(selected + 1);
+}
+
+static const char *
+robot_voice_action_mimo_prompt(enum robot_voice_simple_action_e action)
+{
+  switch (action)
+    {
+      case ROBOT_VOICE_ACTION_TAIL_WAG:
+        return "只调用 robot_tail_wag，使用默认参数。";
+      case ROBOT_VOICE_ACTION_FORWARD:
+        return "只调用 robot_move，direction=forward，steps=1。";
+      case ROBOT_VOICE_ACTION_BACKWARD:
+        return "只调用 robot_move，direction=backward，steps=1。";
+      case ROBOT_VOICE_ACTION_LEFT:
+        return "只调用 robot_move，direction=left，steps=1。";
+      case ROBOT_VOICE_ACTION_RIGHT:
+        return "只调用 robot_move，direction=right，steps=1。";
+      case ROBOT_VOICE_ACTION_HAPPY:
+        return "只调用 robot_set_expression，expression=happy。";
+      case ROBOT_VOICE_ACTION_NONE:
+      default:
+        return NULL;
+    }
+}
+
+static int
+robot_voice_execute_local_action(enum robot_voice_simple_action_e action)
+{
+  enum robot_motion_direction_e direction;
+
+  switch (action)
+    {
+      case ROBOT_VOICE_ACTION_TAIL_WAG:
+        return robot_motion_tail_wag_sync(
+          ROBOT_MOTION_SOURCE_CLI,
+          ROBOT_MOTION_TAIL_DEFAULT_CYCLES,
+          ROBOT_MOTION_TAIL_DEFAULT_PERIOD,
+          ROBOT_MOTION_TAIL_DEFAULT_AMPLITUDE);
+
+      case ROBOT_VOICE_ACTION_FORWARD:
+        direction = ROBOT_MOTION_FORWARD;
+        break;
+      case ROBOT_VOICE_ACTION_BACKWARD:
+        direction = ROBOT_MOTION_BACKWARD;
+        break;
+      case ROBOT_VOICE_ACTION_LEFT:
+        direction = ROBOT_MOTION_LEFT;
+        break;
+      case ROBOT_VOICE_ACTION_RIGHT:
+        direction = ROBOT_MOTION_RIGHT;
+        break;
+
+      case ROBOT_VOICE_ACTION_HAPPY:
+        return robot_expression_set(ROBOT_EXPRESSION_SOURCE_AGENT,
+                                    ROBOT_EXPRESSION_HAPPY, 1800);
+
+      case ROBOT_VOICE_ACTION_NONE:
+      default:
+        return -EINVAL;
+    }
+
+  return robot_motion_execute_sync(ROBOT_MOTION_SOURCE_CLI, direction, 1,
+                                   robot_motion_default_period(direction));
+}
+
 #define ROBOT_VOICE_LOCAL_MUSIC_PATH "/etc/media/test.wav"
 
 static bool robot_voice_rewrite_local_music_request(const char *text,
@@ -553,9 +736,76 @@ static void *voice_record_worker(void *arg)
       (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_VOICE,
                                   ROBOT_EXPRESSION_THINKING, 0);
 
+      enum robot_voice_simple_action_e simple_action =
+        robot_voice_classify_simple_action(text);
+
+#if ROBOT_VOICE_LOCAL_ACTION_FAST_PATH
+      if (simple_action != ROBOT_VOICE_ACTION_NONE)
+        {
+          unsigned long long fast_start = robot_voice_now_ms();
+          int action_ret;
+
+          printf("[RV-FAST] local action=%d begin\n", (int)simple_action);
+          contest_voice_set_state(CONTEST_VOICE_WAIT_AGENT);
+          robot_world_state_set_conversation_active(true);
+          g_voice_reply_pending = true;
+
+          action_ret = robot_voice_execute_local_action(simple_action);
+
+          printf("[RV-FAST] local action=%d rc=%d latency_ms=%llu\n",
+                 (int)simple_action, action_ret,
+                 robot_voice_now_ms() - fast_start);
+
+          if (action_ret == 0)
+            {
+              /* Motion has completed here, so TTS no longer conflicts with PWM. */
+              (void)voice_channel_speak("好呀。");
+            }
+          else
+            {
+              g_voice_reply_pending = false;
+              robot_world_state_set_conversation_active(false);
+              (void)robot_expression_clear(ROBOT_EXPRESSION_SOURCE_VOICE);
+              (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_SYSTEM,
+                                          ROBOT_EXPRESSION_ERROR, 1500);
+              if (g_voice_running && !g_voice_stop_requested)
+                {
+                  contest_voice_set_state(CONTEST_VOICE_RECORDING);
+                }
+            }
+
+          if (g_voice_oneshot)
+            {
+              break;
+            }
+
+          continue;
+        }
+#endif
+
       const char *agent_text = text;
-      if (robot_voice_rewrite_local_music_request(text, routed_text,
-                                                   sizeof(routed_text)))
+      const char *agent_chat_id = "voice";
+
+      /*
+       * When local fast path is disabled, keep deterministic actions in MiMo
+       * Tool Call, but do not attach the normal long voice conversation history.
+       */
+      if (simple_action != ROBOT_VOICE_ACTION_NONE)
+        {
+          const char *short_prompt =
+            robot_voice_action_mimo_prompt(simple_action);
+
+          if (short_prompt != NULL)
+            {
+              agent_text = short_prompt;
+              agent_chat_id = "voice_action";
+              (void)session_clear(agent_chat_id);
+              printf("[RV-FAST] MiMo stateless action route: '%s' -> '%s'\n",
+                     text, agent_text);
+            }
+        }
+      else if (robot_voice_rewrite_local_music_request(text, routed_text,
+                                                        sizeof(routed_text)))
         {
           agent_text = routed_text;
           printf("[RV-MUSIC-ROUTE] rewrite: '%s' -> '%s'\n",
@@ -565,11 +815,11 @@ static void *voice_record_worker(void *arg)
       agent_msg_t msg;
       memset(&msg, 0, sizeof(msg));
       strncpy(msg.channel, AGENT_CHAN_VOICE, sizeof(msg.channel) - 1);
-      strncpy(msg.chat_id, "voice", sizeof(msg.chat_id) - 1);
+      strncpy(msg.chat_id, agent_chat_id, sizeof(msg.chat_id) - 1);
       msg.content = strdup(agent_text);
       contest_voice_set_state(CONTEST_VOICE_WAIT_AGENT);
       robot_world_state_set_conversation_active(true);
-      printf("[RV-VOICE] push inbound voice:voice\n");
+      printf("[RV-VOICE] push inbound voice:%s\n", agent_chat_id);
       g_voice_reply_pending = true;
       if (msg.content == NULL || message_bus_push_inbound(&msg) != OK)
         {
@@ -1145,8 +1395,69 @@ static char g_api_key[256];
 
 static int robot_voice_pcm_sink(const uint8_t *pcm, size_t len, void *arg)
 {
+  uint8_t scaled[ROBOT_VOICE_TTS_SCALE_CHUNK];
+  size_t offset = 0;
+
   (void)arg;
-  return robot_audio_playback_write(pcm, len);
+
+  if (pcm == NULL || len == 0)
+    {
+      return -EINVAL;
+    }
+
+  /*
+   * TTS PCM is signed 16-bit little-endian.  Scale sample amplitude to 1/2
+   * before handing it to the existing audio playback path.
+   */
+  while (offset < len)
+    {
+      size_t chunk = len - offset;
+      size_t even;
+      size_t i;
+      int ret;
+
+      if (chunk > sizeof(scaled))
+        {
+          chunk = sizeof(scaled);
+        }
+
+      /* Keep PCM16 sample pairs intact. */
+      if ((chunk & 1u) != 0 && chunk > 1)
+        {
+          chunk--;
+        }
+
+      even = chunk & ~(size_t)1u;
+      for (i = 0; i < even; i += 2)
+        {
+          uint16_t raw = (uint16_t)pcm[offset + i] |
+                         ((uint16_t)pcm[offset + i + 1] << 8);
+          int16_t sample = (int16_t)raw;
+          int16_t quieter =
+            (int16_t)((sample * ROBOT_VOICE_TTS_GAIN_NUM) /
+                      ROBOT_VOICE_TTS_GAIN_DEN);
+
+          scaled[i] = (uint8_t)((uint16_t)quieter & 0xff);
+          scaled[i + 1] = (uint8_t)(((uint16_t)quieter >> 8) & 0xff);
+        }
+
+      /* PCM16 should always arrive aligned. Preserve a final odd byte rather
+       * than dropping it if an upstream callback ever violates that contract. */
+      if (chunk > even)
+        {
+          scaled[even] = pcm[offset + even];
+        }
+
+      ret = robot_audio_playback_write(scaled, chunk);
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      offset += chunk;
+    }
+
+  return 0;
 }
 
 static int robot_voice_once(void)

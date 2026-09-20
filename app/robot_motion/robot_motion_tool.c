@@ -57,13 +57,13 @@ static char *robot_motion_tool_get_tools(void)
     "\"maximum\":3000}},\"required\":[\"direction\"]}},"
     "{\"name\":\"robot_tail_wag\","
     "\"description\":\"" ROBOT_SIDE_EFFECT_TOOL_POLICY
-    "Make the robot dog wag its tail using an ultra-low-peak-current soft-ramp "
+    "Make the robot dog wag its tail using a brownout-aware low-current soft-ramp "
     "profile. Prefer the defaults, especially during music or TTS. The "
     "motion uses tiny segmented steps with recovery gaps and returns to "
     "center. Do not invent servo angles or request aggressive settings.\","
     "\"input_schema\":{\"type\":\"object\",\"properties\":{"
     "\"cycles\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":2},"
-    "\"amplitude_deg\":{\"type\":\"integer\",\"minimum\":3,\"maximum\":8},"
+    "\"amplitude_deg\":{\"type\":\"integer\",\"minimum\":3,\"maximum\":20},"
     "\"period_ms\":{\"type\":\"integer\",\"minimum\":2600,\"maximum\":3000}},"
     "\"required\":[]}}]";
 
@@ -255,7 +255,7 @@ static int robot_motion_tool_execute_tail_wag(const char *name,
     {
       cJSON_Delete(root);
       snprintf(output, output_size,
-               "{\"ok\":false,\"error\":\"amplitude_deg must be 3..8\"}");
+               "{\"ok\":false,\"error\":\"amplitude_deg must be 3..20\"}");
       return ERROR;
     }
 

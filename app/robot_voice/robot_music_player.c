@@ -27,6 +27,10 @@
 #define ROBOT_MUSIC_PATH_MAX         256
 #define ROBOT_MUSIC_WORKER_STACK     (16 * 1024)
 
+/* Music software gain: 1/2 amplitude ~= -6.02 dB. */
+#define ROBOT_MUSIC_GAIN_NUM          1
+#define ROBOT_MUSIC_GAIN_DEN          2
+
 struct robot_music_job_s
 {
   char path[ROBOT_MUSIC_PATH_MAX];
@@ -37,6 +41,22 @@ static bool g_robot_music_active;
 static bool g_robot_music_tool_registered;
 static char g_robot_music_path[ROBOT_MUSIC_PATH_MAX];
 static int g_robot_music_last_result;
+
+static void robot_music_scale_pcm16_half(uint8_t *buf, size_t len)
+{
+  size_t i;
+
+  for (i = 0; i + 1 < len; i += 2)
+    {
+      uint16_t raw = (uint16_t)buf[i] | ((uint16_t)buf[i + 1] << 8);
+      int16_t sample = (int16_t)raw;
+      int16_t scaled =
+        (int16_t)((sample * ROBOT_MUSIC_GAIN_NUM) / ROBOT_MUSIC_GAIN_DEN);
+
+      buf[i] = (uint8_t)((uint16_t)scaled & 0xff);
+      buf[i + 1] = (uint8_t)(((uint16_t)scaled >> 8) & 0xff);
+    }
+}
 
 static uint16_t robot_music_u16le(const uint8_t *p)
 {
@@ -327,6 +347,7 @@ int robot_music_play_file(const char *path)
             break;
           }
 
+        robot_music_scale_pcm16_half(pcm, (size_t)nread);
         ret = robot_audio_playback_write(pcm, (size_t)nread);
         if (ret < 0)
           {
