@@ -38,6 +38,11 @@
 #define RV_EVENT_STOPPED             4
 #define RV_EVENT_COMPLETED           6
 
+/* Music/media software gain: 1/2 amplitude ~= -6.02 dB. */
+#define RV_MUSIC_GAIN_NUM            1
+#define RV_MUSIC_GAIN_DEN            2
+#define RV_MUSIC_SCALE_CHUNK         512
+
 typedef void (*rv_media_event_callback)(void *cookie, int event, int result,
                                         const char *extra);
 
@@ -179,7 +184,9 @@ static int rv_write_pcm(struct rv_mp3_decoder *decoder, const int16_t *samples,
       if (decoder->phase >= sample_rate)
         {
           decoder->phase -= sample_rate;
-          decoder->pcm[output_count++] = decoder->mono[i];
+          decoder->pcm[output_count++] =
+            (int16_t)((decoder->mono[i] * RV_MUSIC_GAIN_NUM) /
+                      RV_MUSIC_GAIN_DEN);
           if (output_count == (int)(sizeof(decoder->pcm) /
                                     sizeof(decoder->pcm[0])))
             {
@@ -615,6 +622,65 @@ int media_player_stop(void *handle)
   return 0;
 }
 
+static int rv_write_scaled_pcm16(const void *data, size_t len)
+{
+  const uint8_t *src = data;
+  uint8_t scaled[RV_MUSIC_SCALE_CHUNK];
+  size_t offset = 0;
+
+  if (!data || len == 0)
+    {
+      return -EINVAL;
+    }
+
+  while (offset < len)
+    {
+      size_t chunk = len - offset;
+      size_t even;
+      size_t i;
+      int ret;
+
+      if (chunk > sizeof(scaled))
+        {
+          chunk = sizeof(scaled);
+        }
+
+      if ((chunk & 1u) != 0 && chunk > 1)
+        {
+          chunk--;
+        }
+
+      even = chunk & ~(size_t)1u;
+
+      for (i = 0; i < even; i += 2)
+        {
+          uint16_t raw = (uint16_t)src[offset + i] |
+                         ((uint16_t)src[offset + i + 1] << 8);
+          int16_t sample = (int16_t)raw;
+          int16_t quieter =
+            (int16_t)((sample * RV_MUSIC_GAIN_NUM) / RV_MUSIC_GAIN_DEN);
+
+          scaled[i] = (uint8_t)((uint16_t)quieter & 0xff);
+          scaled[i + 1] = (uint8_t)(((uint16_t)quieter >> 8) & 0xff);
+        }
+
+      if (chunk > even)
+        {
+          scaled[even] = src[offset + even];
+        }
+
+      ret = robot_audio_playback_write(scaled, chunk);
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      offset += chunk;
+    }
+
+  return 0;
+}
+
 ssize_t media_player_write_data(void *handle, const void *data, size_t len)
 {
   struct rv_media_player *player = handle;
@@ -632,7 +698,8 @@ ssize_t media_player_write_data(void *handle, const void *data, size_t len)
       return -EINVAL;
     }
   pthread_mutex_unlock(&player->lock);
-  return robot_audio_playback_write(data, len);
+
+  return rv_write_scaled_pcm16(data, len);
 }
 
 int media_player_pause(void *handle)

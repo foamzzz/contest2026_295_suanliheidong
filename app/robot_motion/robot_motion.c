@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "robot_motion.h"
 #include "robotctl_servo.h"
@@ -210,32 +211,43 @@ static int robot_motion_safe_settle(unsigned int period_ms)
 }
 
 /*
- * Tail-specific ultra-low-peak-current profile.
+ * Tail sweep profile tuned for a smoother visible wag.
  *
- * Tail wagging is intentionally much gentler than walking because it is often
- * triggered while audio/TTS is already consuming power.  The important rule
- * here is not only "move slowly", but also "never keep driving through a large
- * angular excursion in one PWM session".
+ * The motion layer now travels in large ~24-degree segments so PWM is not
+ * stopped every 10 degrees.  robotctl_servo_move_one() still keeps its own
+ * small safe PWM ramp internally, so this is not a one-frame 24-degree jump.
  *
- * Every 2-degree micro-step is issued as an independent servo command.  The
- * servo layer stops PWM after that command, then this layer waits for the
- * supply rail to recover before issuing the next micro-step.
+ * Requested demo geometry:
+ *   center -> +25 deg -> -24 deg -> center
+ *
+ * The cross-side move is split into 24/25-degree powered segments with a short
+ * unloaded recovery gap.  This removes most of the old stop/start feeling
+ * while retaining a brownout recovery window.
  */
-#define ROBOT_MOTION_TAIL_MICRO_STEP_DEG 2
+#define ROBOT_MOTION_TAIL_SEGMENT_DEG 24
+#define ROBOT_MOTION_TAIL_DIRECT_LIMIT_DEG 25
+#define ROBOT_MOTION_TAIL_RIGHT_OFFSET_DEG 25
+#define ROBOT_MOTION_TAIL_LEFT_OFFSET_DEG 24
 #define ROBOT_MOTION_TAIL_OPEN_RECOVERY_MS 500
-#define ROBOT_MOTION_TAIL_ENDPOINT_SETTLE_MS 10
+/* 50 Hz PWM = 20 ms per period.  One endpoint period is enough here because
+ * the servo layer already keeps PWM active throughout its internal 3-degree
+ * ramp for the whole 24/25-degree segment. */
+#define ROBOT_MOTION_TAIL_ENDPOINT_SETTLE_MS 20
 
 static int robot_motion_tail_interval(unsigned int period_ms)
 {
-  int interval_ms = (int)period_ms / 45;
+  /* Keep one 50 Hz period between the servo layer's internal 3-degree updates.
+   * A nearly fixed 20-24 ms cadence makes a 24/25-degree sweep look continuous
+   * without extending the powered window more than necessary. */
+  int interval_ms = (int)period_ms / 140;
 
-  if (interval_ms < 60)
+  if (interval_ms < 20)
     {
-      interval_ms = 60;
+      interval_ms = 20;
     }
-  else if (interval_ms > 80)
+  else if (interval_ms > 24)
     {
-      interval_ms = 80;
+      interval_ms = 24;
     }
 
   return interval_ms;
@@ -243,15 +255,17 @@ static int robot_motion_tail_interval(unsigned int period_ms)
 
 static int robot_motion_tail_cooldown_ms(unsigned int period_ms)
 {
+  /* Large segments reduce the number of PWM stop/start cycles.  Keep a short
+   * unloaded gap for the servo rail, but avoid the old half-second pause. */
   int cooldown_ms = (int)period_ms / 10;
 
   if (cooldown_ms < 260)
     {
       cooldown_ms = 260;
     }
-  else if (cooldown_ms > 340)
+  else if (cooldown_ms > 320)
     {
-      cooldown_ms = 340;
+      cooldown_ms = 320;
     }
 
   return cooldown_ms;
@@ -291,7 +305,7 @@ static int robot_motion_tail_micro_move(struct robotctl_servo_ctx_s *ctx,
 
   /*
    * robotctl_servo_move_one() stops PWM when the micro-move completes.  Keep
-   * the rail unloaded for a while before the next 1-2 degree request.
+   * the rail unloaded briefly before the next 24/25-degree segment.
    */
   return robot_motion_tail_cooldown(cooldown_ms);
 }
@@ -319,13 +333,19 @@ static int robot_motion_tail_ramp_to(struct robotctl_servo_ctx_s *ctx,
         }
 
       delta = target - current;
-      if (delta > ROBOT_MOTION_TAIL_MICRO_STEP_DEG)
+      if (delta >= -ROBOT_MOTION_TAIL_DIRECT_LIMIT_DEG &&
+          delta <= ROBOT_MOTION_TAIL_DIRECT_LIMIT_DEG)
         {
-          next = current + ROBOT_MOTION_TAIL_MICRO_STEP_DEG;
+          /* Avoid a tiny 1-degree tail segment at a 25-degree endpoint. */
+          next = target;
         }
-      else if (delta < -ROBOT_MOTION_TAIL_MICRO_STEP_DEG)
+      else if (delta > ROBOT_MOTION_TAIL_SEGMENT_DEG)
         {
-          next = current - ROBOT_MOTION_TAIL_MICRO_STEP_DEG;
+          next = current + ROBOT_MOTION_TAIL_SEGMENT_DEG;
+        }
+      else if (delta < -ROBOT_MOTION_TAIL_SEGMENT_DEG)
+        {
+          next = current - ROBOT_MOTION_TAIL_SEGMENT_DEG;
         }
       else
         {
@@ -552,18 +572,21 @@ static int robot_motion_execute_tail_wag(
 {
   struct robotctl_servo_ctx_s ctx;
   const int center = g_robotctl_home[ROBOTCTL_TAIL];
-  const int left = center - (int)request->amplitude_deg;
-  const int right = center + (int)request->amplitude_deg;
+  const int right = center + ROBOT_MOTION_TAIL_RIGHT_OFFSET_DEG;
+  const int left = center - ROBOT_MOTION_TAIL_LEFT_OFFSET_DEG;
   int interval_ms = robot_motion_tail_interval(request->period_ms);
   int cooldown_ms = robot_motion_tail_cooldown_ms(request->period_ms);
   int ret;
   unsigned int cycle;
 
-  printf("[ROBOT-MOTION] tail wag begin cycles=%u amplitude=%u "
-         "period_ms=%u interval_ms=%d cooldown_ms=%d "
-         "micro_step=%d profile=ultra_low_peak\n",
-         request->steps, request->amplitude_deg, request->period_ms,
-         interval_ms, cooldown_ms, ROBOT_MOTION_TAIL_MICRO_STEP_DEG);
+  printf("[ROBOT-MOTION] tail wag begin cycles=%u requested_amplitude=%u "
+         "right_offset=%d left_offset=%d period_ms=%u interval_ms=%d "
+         "cooldown_ms=%d segment_deg=%d profile=smooth_sweep\n",
+         request->steps, request->amplitude_deg,
+         ROBOT_MOTION_TAIL_RIGHT_OFFSET_DEG,
+         ROBOT_MOTION_TAIL_LEFT_OFFSET_DEG,
+         request->period_ms, interval_ms, cooldown_ms,
+         ROBOT_MOTION_TAIL_SEGMENT_DEG);
 
   ret = robotctl_servo_open(&ctx);
   if (ret < 0)
@@ -581,16 +604,13 @@ static int robot_motion_execute_tail_wag(
   ret = robot_motion_tail_cooldown(ROBOT_MOTION_TAIL_OPEN_RECOVERY_MS);
 
   /*
-   * Ultra-low-peak pattern:
+   * Smooth sweep pattern:
    *
-   *   soft-ramp center
-   *      -> soft-ramp right
-   *      -> soft-ramp center
-   *      -> soft-ramp left
-   *      -> soft-ramp center
+   *   center -> right(+25) -> left(-24) -> center
    *
-   * A "soft-ramp" is composed of <=2-degree independent commands.  PWM is
-   * stopped and a recovery delay is inserted after every micro-step.
+   * The right-to-left transition no longer returns to center first.  It is
+   * split internally into 24/25-degree motion segments, each of which still
+   * uses robotctl_servo_move_one()'s smaller safe PWM ramp.
    */
   if (ret >= 0)
     {
@@ -605,25 +625,21 @@ static int robot_motion_execute_tail_wag(
           break;
         }
 
-      printf("[ROBOT-MOTION] tail wag cycle=%u/%u side=right\n",
+      printf("[ROBOT-MOTION] tail wag cycle=%u/%u sweep=center->right\n",
              cycle + 1, request->steps);
       ret = robot_motion_tail_ramp_to(&ctx, right, interval_ms, cooldown_ms);
 
       if (ret >= 0)
         {
-          ret = robot_motion_tail_ramp_to(&ctx, center,
-                                          interval_ms, cooldown_ms);
-        }
-
-      if (ret >= 0)
-        {
-          printf("[ROBOT-MOTION] tail wag cycle=%u/%u side=left\n",
+          printf("[ROBOT-MOTION] tail wag cycle=%u/%u sweep=right->left\n",
                  cycle + 1, request->steps);
           ret = robot_motion_tail_ramp_to(&ctx, left, interval_ms, cooldown_ms);
         }
 
       if (ret >= 0)
         {
+          printf("[ROBOT-MOTION] tail wag cycle=%u/%u sweep=left->center\n",
+                 cycle + 1, request->steps);
           ret = robot_motion_tail_ramp_to(&ctx, center,
                                           interval_ms, cooldown_ms);
         }
@@ -1127,7 +1143,8 @@ int robot_motion_tail_wag_sync(enum robot_motion_source_e source,
       return -EINVAL;
     }
 
-  timeout_ms = (uint32_t)((uint64_t)cycles * period_ms * 2ULL +
+  /* Keep a generous wait budget for the brownout-aware segmented wag. */
+  timeout_ms = (uint32_t)((uint64_t)cycles * period_ms * 4ULL +
                           ROBOT_MOTION_WAIT_MARGIN_MS);
   if (timeout_ms > ROBOT_MOTION_MAX_TIMEOUT_MS)
     {
