@@ -52,7 +52,7 @@
 
 /* F7H: pace AUDIO_CALLBACK_DEQUEUE at the real PCM consumption rate.
  *
- * The proven robot_audio_playback backend copies PCM into a 256 KiB ring.
+ * The proven robot_audio_playback backend copies PCM into a 512 KiB ring.
  * Returning an APB immediately after that copy makes FFmpeg believe the
  * hardware consumed all periods instantly, which triggers its
  * "playback underflow! pause" path.  Keep the APB owned by this lower-half
@@ -63,6 +63,12 @@
 #define CONTEST_MEDIA_PACE_QUEUE      16
 #define CONTEST_MEDIA_PACE_STACK      8192
 #define CONTEST_MEDIA_PACE_SLICE_US   5000
+
+/* Music volume is scaled only in the Media PCM bridge.  TTS uses the
+ * application playback path directly and is intentionally unaffected. */
+#define CONTEST_MEDIA_MUSIC_GAIN_NUM  1
+#define CONTEST_MEDIA_MUSIC_GAIN_DEN  2
+#define CONTEST_MEDIA_GAIN_CHUNK      512
 
 /****************************************************************************
  * Weak playback backend
@@ -120,6 +126,7 @@ struct contest_media_sink_s
   unsigned int pace_head;
   unsigned int pace_tail;
   unsigned int pace_count;
+  bool pace_busy;
   bool pace_clock_valid;
   uint64_t pace_deadline_us;
   struct contest_media_pending_s pending[CONTEST_MEDIA_PACE_QUEUE];
@@ -227,6 +234,59 @@ static bool contest_media_backend_available(void)
          robot_audio_playback_close != NULL;
 }
 
+static int contest_media_write_music_pcm(FAR const uint8_t *pcm, size_t len)
+{
+  uint8_t scaled[CONTEST_MEDIA_GAIN_CHUNK];
+  size_t offset = 0;
+
+  if (pcm == NULL || len == 0 || (len & 1) != 0)
+    {
+      return -EINVAL;
+    }
+
+  while (offset < len)
+    {
+      size_t chunk = len - offset;
+      size_t i;
+      int ret;
+
+      if (chunk > sizeof(scaled))
+        {
+          chunk = sizeof(scaled);
+        }
+
+      chunk &= ~(size_t)1u;
+      if (chunk == 0)
+        {
+          return -EINVAL;
+        }
+
+      for (i = 0; i < chunk; i += sizeof(int16_t))
+        {
+          uint16_t raw = (uint16_t)pcm[offset + i] |
+                         ((uint16_t)pcm[offset + i + 1] << 8);
+          int16_t sample = (int16_t)raw;
+          int16_t quieter =
+            (int16_t)(((int32_t)sample * CONTEST_MEDIA_MUSIC_GAIN_NUM) /
+                      CONTEST_MEDIA_MUSIC_GAIN_DEN);
+
+          scaled[i] = (uint8_t)((uint16_t)quieter & 0xff);
+          scaled[i + 1] =
+            (uint8_t)(((uint16_t)quieter >> 8) & 0xff);
+        }
+
+      ret = robot_audio_playback_write(scaled, chunk);
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      offset += chunk;
+    }
+
+  return OK;
+}
+
 static int contest_media_open_playback(FAR struct contest_media_sink_s *sink)
 {
   int ret;
@@ -283,6 +343,7 @@ static int contest_media_open_playback(FAR struct contest_media_sink_s *sink)
   sink->enqueue_count = 0;
   sink->dequeue_count = 0;
   sink->position_query_count = 0;
+  sink->pace_busy = false;
   sink->pace_clock_valid = false;
   sink->pace_deadline_us = 0;
 
@@ -484,6 +545,7 @@ static bool contest_media_pop_apb(FAR struct contest_media_sink_s *sink,
   *entry = sink->pending[sink->pace_head];
   sink->pace_head = (sink->pace_head + 1) % CONTEST_MEDIA_PACE_QUEUE;
   sink->pace_count--;
+  sink->pace_busy = true;
 
   if (sink->pace_count == 0)
     {
@@ -535,7 +597,7 @@ static void *contest_media_pace_worker(FAR void *arg)
                      aborted ? 0 : 1, entry.final ? 1 : 0);
             }
 
-          if (entry.final)
+          if (entry.final && !aborted)
             {
               int ret;
 
@@ -550,6 +612,16 @@ static void *contest_media_pace_worker(FAR void *arg)
                   syslog(LOG_ERR,
                          "[MEDIA-BRIDGE] final drain failed=%d\n", ret);
                 }
+            }
+
+          /* Mark the APB idle only after its callback and any FINAL handling
+           * have finished.  STOP waits for this flag as well as an empty
+           * queue, otherwise it can race the current pacing operation. */
+          if (nxsem_wait_uninterruptible(&sink->pace_lock) == OK)
+            {
+              sink->pace_busy = false;
+              nxsem_post(&sink->pace_empty);
+              nxsem_post(&sink->pace_lock);
             }
         }
     }
@@ -606,6 +678,7 @@ static int contest_media_abort_pending(FAR struct contest_media_sink_s *sink)
   for (;;)
     {
       unsigned int count;
+      bool busy;
 
       ret = nxsem_wait_uninterruptible(&sink->pace_lock);
       if (ret < 0)
@@ -614,9 +687,10 @@ static int contest_media_abort_pending(FAR struct contest_media_sink_s *sink)
         }
 
       count = sink->pace_count;
+      busy = sink->pace_busy;
       nxsem_post(&sink->pace_lock);
 
-      if (count == 0)
+      if (count == 0 && !busy)
         {
           break;
         }
@@ -883,29 +957,25 @@ static int contest_media_stop(FAR struct audio_lowerhalf_s *dev)
   (void)session;
 #endif
 
-  syslog(LOG_INFO, "[MEDIA-BRIDGE] STOP -> graceful EOS/drain\n");
+  syslog(LOG_INFO, "[MEDIA-BRIDGE] STOP -> immediate abort/close\n");
 
   /*
-   * F7K:
+   * An explicit AUDIOIOC_STOP is a user/tool stop, not natural end-of-file.
+   * Do not call robot_audio_playback_finish() here: finish() drains the
+   * playback ring by design, which makes a "stop" command continue playing
+   * any already-buffered PCM before the device is closed.
    *
-   * FFmpeg's NuttX output path does not guarantee that natural file EOF is
-   * delivered to this lower-half as an AUDIO_APB_FINAL buffer.  Its normal
-   * trailer/close path does, however, issue AUDIOIOC_STOP after the remaining
-   * partial APB has been enqueued.
+   * First return APBs still waiting in the pacing queue, then close the
+   * hardware path without draining the private PCM ring.  COMPLETE tells the
+   * Media upper-half that this playback instance is terminal and permits the
+   * caller to return to the normal vela> state.
    *
-   * Every APB handed to us has already been copied into
-   * robot_audio_playback's private PCM ring, so first return any APBs still
-   * waiting in the pacing queue, then turn STOP into the producer EOS signal
-   * for RV-PB.  robot_audio_playback_finish() drains all real PCM, overwrites
-   * the immutable cyclic DMA slots with silence, stops I2S and joins the
-   * worker.  Only then send COMPLETE back to FFmpeg.
-   *
-   * This prevents both failure modes seen in testing:
-   *   - stale tail audio repeating forever;
-   *   - F7I/F7J silence-fill continuing forever after file EOF.
+   * Natural EOF remains handled by the FINAL APB / pacer path below, where
+   * robot_audio_playback_finish() is intentionally used to drain the real
+   * tail before COMPLETE.
    */
   (void)contest_media_abort_pending(sink);
-  ret = contest_media_finish_playback(sink, true);
+  ret = contest_media_finish_playback(sink, false);
   contest_media_complete(sink);
   return ret;
 }
@@ -1045,7 +1115,7 @@ static int contest_media_enqueuebuffer(FAR struct audio_lowerhalf_s *dev,
 
   if (len > 0)
     {
-      ret = robot_audio_playback_write(&apb->samp[apb->curbyte], len);
+      ret = contest_media_write_music_pcm(&apb->samp[apb->curbyte], len);
       if (ret < 0)
         {
           if (ret == -EPIPE || ret == -ECANCELED)

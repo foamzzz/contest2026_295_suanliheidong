@@ -51,26 +51,26 @@
   ((RV_SOURCE_BLOCK_BYTES / sizeof(int16_t)) * RV_WIRE_BYTES_PER_SAMPLE)
 /*
  * Must match contest_i2s.c:
- *   CONTEST_I2S_TX_RING_SLOTS = 8
+ *   CONTEST_I2S_TX_RING_SLOTS = 16
  *   CONTEST_I2S_TX_SLOT_BYTES = 2048
  *
- * The lower half does not start its immutable DMA ring until all eight slots
+ * The lower half does not start its immutable DMA ring until all sixteen slots
  * have been bound once.  Therefore the upper layer must be able to submit all
- * eight initial requests without waiting for a completion.
+ * sixteen initial requests without waiting for a completion.
  */
-#define RV_LOWER_DMA_RING_SLOTS      10
+#define RV_LOWER_DMA_RING_SLOTS      16
 #define RV_LOWER_DMA_SLOT_BYTES      2048
 #define RV_MAX_INFLIGHT              RV_LOWER_DMA_RING_SLOTS
 #define RV_SEND_TIMEOUT_MS           1000
 
 /* F7J transient producer-gap grace.
  *
- * One 1024-byte PCM16 source block is ~21.3 ms.  With ten immutable DMA
+ * One 1024-byte PCM16 source block is ~21.3 ms.  With sixteen immutable DMA
  * slots, once a slot is released there is far more than 15 ms before that
  * same physical slot is needed again.  Use part of that safety window to
  * wait for late Media PCM instead of inserting an audible silent block.
  */
-#define RV_UNDERRUN_GRACE_US          100000
+#define RV_UNDERRUN_GRACE_US          500000
 #define RV_UNDERRUN_POLL_US            2000
 
 /*
@@ -95,8 +95,8 @@
 /*
  * Ring-buffer values from tts_pcm_playback_guide.md:
  *
- *   Ring Buffer     = 256 KiB
- *   Start Prebuffer =  64 KiB
+ *   Ring Buffer     = 512 KiB
+ *   Start Prebuffer = 128 KiB
  *   Rebuffer        =  48 KiB (legacy threshold; F7I does not rebuffer once PLAYING)
  *
  * The playback worker is created at open time and waits in PREBUFFER while
@@ -111,8 +111,8 @@
 #  define RV_RING_BYTES             (2 * 1024 * 1024)
 #  define RV_START_PREBUFFER_BYTES  RV_RING_BYTES
 #else
-#  define RV_RING_BYTES             (256 * 1024)
-#  define RV_START_PREBUFFER_BYTES  (64 * 1024)
+#  define RV_RING_BYTES             (512 * 1024)
+#  define RV_START_PREBUFFER_BYTES  (128 * 1024)
 #endif
 #define RV_REBUFFER_BYTES           (48 * 1024)
 
@@ -875,7 +875,7 @@ static void *rv_worker(void *arg)
       /* Deeper DMA submit window:
        * prime all fixed slots, then wait/refill round-robin.
        *
-       * Eight 1024-byte source blocks provide about 170 ms of 24 kHz mono
+       * Sixteen 1024-byte source blocks provide about 341 ms of 24 kHz mono
        * PCM queue depth. Each source block remains 1024 bytes on the wire.
        * while giving HPWORK/callback/worker jitter twice as much time before
        * a zero-filled slot can wrap back to hardware.
@@ -970,7 +970,7 @@ static void *rv_worker(void *arg)
            * F7I: NEVER stop feeding the immutable cyclic DMA ring after
            * PLAYING has started.
            *
-           * The lower half keeps its 10 frozen descriptors circulating even
+           * The lower half keeps its 16 frozen descriptors circulating even
            * when the upper layer has no logical requests in flight.  The old
            * REBUFFER path stopped submitting new payloads while waiting for
            * 48 KiB of producer data; hardware then replayed the stale tail
@@ -1240,7 +1240,7 @@ static int rv_start_i2s_playback(struct rv_playback_s *pb)
   /*
    * Hard guard against another upper/lower mismatch.  The current
    * contest_i2s.c accepts only fixed 2048-byte TX requests and starts its
-   * immutable ring only after eight slots have been populated.
+   * immutable ring only after all slots have been populated.
    */
   if (RV_WIRE_BLOCK_BYTES != RV_LOWER_DMA_SLOT_BYTES ||
       RV_MAX_INFLIGHT != RV_LOWER_DMA_RING_SLOTS)
