@@ -31,6 +31,10 @@ int robot_proactive_post(enum robot_event_type_e type, const char *detail);
 int robot_proactive_post_ex(enum robot_event_type_e type, const char *source,
                             const char *detail,
                             const struct robot_event_payload_s *payload);
+#define ROBOT_MUSIC_COMPANION_CHAT_ID "robot_music_companion"
+int robot_proactive_music_session_update(enum robot_music_state_e state,
+  uint32_t session_id, const char *track, const char *category,
+  const char *mood, uint16_t tempo_bpm);
 int robot_proactive_music_update(enum robot_music_state_e state,
                                  const char *track, const char *category,
                                  const char *mood, uint16_t tempo_bpm);

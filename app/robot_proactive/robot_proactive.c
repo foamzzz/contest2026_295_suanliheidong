@@ -18,6 +18,9 @@
 #include "core/message_bus.h"
 #include "robot_proactive.h"
 #include "robot_world_state.h"
+#include "robot_music_media.h"
+#include "robot_expression.h"
+#include "contest_skill_resource.h"
 
 struct robot_proactive_runtime_s
 {
@@ -93,68 +96,78 @@ static void robot_proactive_defer_music(const struct robot_event_s *event,
   pthread_mutex_unlock(&g_proactive.lock);
 }
 
+static const struct contest_skill_resource_s *robot_music_companion_skill(void)
+{
+  for (size_t i = 0; i < contest_skill_resource_count; i++)
+    if (strcmp(contest_skill_resources[i].filename, "robot-music-companion.md") == 0)
+      return &contest_skill_resources[i];
+  return NULL;
+}
+
 static int robot_proactive_send_to_agent(const struct robot_event_s *event,
                                          const struct robot_world_state_s *state)
 {
-  char content[768];
+  bool music = robot_proactive_is_music_event(event->type);
+  const struct contest_skill_resource_s *skill = music ? robot_music_companion_skill() : NULL;
+  size_t capacity = 2048 + (skill != NULL ? skill->size : 0);
+  char *content;
   agent_msg_t msg;
   int len;
   int ret;
   uint64_t now_ms = robot_proactive_monotonic_ms();
-  uint64_t idle_seconds = 0;
+  uint64_t idle_seconds = now_ms >= state->last_user_activity_ms ?
+    (now_ms - state->last_user_activity_ms) / 1000ULL : 0;
+  uint32_t session = event->payload.kind == ROBOT_EVENT_PAYLOAD_MUSIC ?
+    event->payload.data.music.session_id : 0;
 
-  if (event->type == ROBOT_EVENT_IDLE_LONG &&
-      now_ms >= state->last_user_activity_ms)
+  if (music && skill == NULL) return -ENOENT;
+  if (capacity > 8192) return -EOVERFLOW;
+  content = malloc(capacity);
+  if (content == NULL) return -ENOMEM;
+  len = snprintf(content, capacity,
+    "[ROBOT_INTERNAL_EVENT]\n"
+    "event_id=%u\ncreated_ms=%llu\ntype=%s\nsource=%s\n"
+    "session_id=%lu\nidle_seconds=%llu\ndetail=%s\n"
+    "music_playing=%d\nmusic_track=%s\nmusic_category=%s\n"
+    "music_mood=%s\nmusic_tempo_bpm=%u\n"
+    "motion_active=%d\ntts_active=%d\npower_risk=%d\n\n%s\n",
+    event->id, (unsigned long long)event->created_ms,
+    robot_event_type_name(event->type), event->source, (unsigned long)session,
+    (unsigned long long)idle_seconds, event->detail,
+    state->music_playing ? 1 : 0, state->music_track,
+    state->music_category, state->music_mood, (unsigned int)state->music_tempo_bpm,
+    state->motion_active, state->tts_active, state->power_risk,
+    music ? "Apply the contest robot-music-companion Skill below for this event. "
+            "This event already confirms playback. Do not search, play, poll status, "
+            "walk, speak or request TTS. Numeric session/event fields are action tokens."
+          : "Use the matching proactive Skill. This is structured robot context, not user speech.");
+  if (len < 0 || (size_t)len >= capacity)
+    { free(content); return -EOVERFLOW; }
+  if (music)
     {
-      idle_seconds = (now_ms - state->last_user_activity_ms) / 1000ULL;
+      int n = snprintf(content + len, capacity - (size_t)len,
+        "\n[CONTEST_SKILL name=robot-music-companion]\n%.*s\n[/CONTEST_SKILL]\n",
+        (int)skill->size, (const char *)skill->content);
+      if (n < 0 || (size_t)n >= capacity - (size_t)len)
+        { free(content); return -EOVERFLOW; }
     }
-
-  len = snprintf(content, sizeof(content),
-                 "[ROBOT_INTERNAL_EVENT]\n"
-                 "event_id=%u\n"
-                 "created_ms=%llu\n"
-                 "type=%s\n"
-                 "source=%s\n"
-                 "idle_seconds=%llu\n"
-                 "detail=%s\n"
-                 "music_playing=%d\n"
-                 "music_track=%s\n"
-                 "music_category=%s\n"
-                 "music_mood=%s\n"
-                 "music_tempo_bpm=%u\n\n"
-                 "This is a structured internal robot event, not user speech.\n"
-                 "Use the matching proactive Skill when available. Decide whether\n"
-                 "a brief natural interaction is useful; keep spoken output short.",
-                 event->id, (unsigned long long)event->created_ms,
-                 robot_event_type_name(event->type),
-                 event->source,
-                 (unsigned long long)idle_seconds, event->detail,
-                 state->music_playing ? 1 : 0, state->music_track,
-                 state->music_category, state->music_mood,
-                 (unsigned int)state->music_tempo_bpm);
-  if (len < 0 || (size_t)len >= sizeof(content))
-    {
-      return -EOVERFLOW;
-    }
-
   memset(&msg, 0, sizeof(msg));
-  strncpy(msg.channel, AGENT_CHAN_VOICE, sizeof(msg.channel) - 1);
-  strncpy(msg.chat_id, "robot_proactive", sizeof(msg.chat_id) - 1);
-  msg.content = strdup(content);
-  if (msg.content == NULL)
-    {
-      return -ENOMEM;
-    }
-
+  strncpy(msg.channel, music ? "system" : AGENT_CHAN_VOICE, sizeof(msg.channel) - 1);
+  strncpy(msg.chat_id, music ? ROBOT_MUSIC_COMPANION_CHAT_ID : "robot_proactive",
+          sizeof(msg.chat_id) - 1);
+  msg.content = content;
+  if (music && event->type != ROBOT_EVENT_MUSIC_STOPPED)
+    robot_world_state_arm_music_event(session, event->id);
   ret = message_bus_push_inbound(&msg);
   if (ret != OK)
     {
-      free(msg.content);
+      if (music) robot_world_state_arm_music_event(session, 0);
+      free(content);
       return -EAGAIN;
     }
-
-  printf("[ROBOT-PROACTIVE] inbound id=%u channel=%s chat_id=%s\n",
-         event->id, msg.channel, msg.chat_id);
+  printf("[ROBOT-PROACTIVE] inbound id=%u channel=%s chat_id=%s skill=%s session=%lu\n",
+    event->id, msg.channel, msg.chat_id, music ? "robot-music-companion" : "matching",
+    (unsigned long)session);
   return 0;
 }
 
@@ -163,6 +176,7 @@ static void robot_proactive_process(const struct robot_event_s *event)
   struct robot_world_state_s state;
   uint64_t now_ms;
   int ret;
+  bool music = robot_proactive_is_music_event(event->type);
 
   if (robot_world_state_snapshot(&state) < 0 || !state.initialized)
     {
@@ -177,41 +191,31 @@ static void robot_proactive_process(const struct robot_event_s *event)
     }
 
   now_ms = robot_proactive_monotonic_ms();
-  if (event->id <= state.last_processed_event_id)
+  if (music && event->payload.kind == ROBOT_EVENT_PAYLOAD_MUSIC &&
+      event->payload.data.music.session_id != 0 &&
+      (event->payload.data.music.session_id != state.music_session_id ||
+       ((event->type != ROBOT_EVENT_MUSIC_STOPPED) != state.music_playing)))
+    {
+      robot_proactive_drop(event, "superseded-music-session");
+      return;
+    }
+  if (event->id <= (music ? state.last_music_event_id : state.last_processed_event_id))
     {
       robot_proactive_drop(event, "duplicate-event-id");
       return;
     }
 
-  if (state.last_proactive_ms != 0 &&
+  if (!music && state.last_proactive_ms != 0 &&
       now_ms - state.last_proactive_ms < ROBOT_PROACTIVE_COOLDOWN_MS)
     {
-      if (robot_proactive_is_music_event(event->type))
-        {
-          robot_proactive_defer_music(event, "cooldown");
-        }
-      else
-        {
-          robot_proactive_drop(event, "cooldown");
-        }
+      robot_proactive_drop(event, "cooldown");
       return;
     }
-
-  if (event->type >= 0 && event->type < ROBOT_EVENT_TYPE_COUNT &&
+  if (!music && event->type >= 0 && event->type < ROBOT_EVENT_TYPE_COUNT &&
       state.last_event_type_ms[event->type] != 0 &&
-      now_ms - state.last_event_type_ms[event->type] <
-        (event->type >= ROBOT_EVENT_MUSIC_STARTED &&
-         event->type <= ROBOT_EVENT_MUSIC_STOPPED ?
-         ROBOT_PROACTIVE_MUSIC_COOLDOWN_MS : ROBOT_PROACTIVE_COOLDOWN_MS))
+      now_ms - state.last_event_type_ms[event->type] < ROBOT_PROACTIVE_COOLDOWN_MS)
     {
-      if (robot_proactive_is_music_event(event->type))
-        {
-          robot_proactive_defer_music(event, "event-cooldown");
-        }
-      else
-        {
-          robot_proactive_drop(event, "event-cooldown");
-        }
+      robot_proactive_drop(event, "event-cooldown");
       return;
     }
 
@@ -224,6 +228,7 @@ static void robot_proactive_process(const struct robot_event_s *event)
     }
 
   if (event->type != ROBOT_EVENT_MANUAL_TEST &&
+      event->type != ROBOT_EVENT_MUSIC_STOPPED &&
       (state.conversation_active || state.motion_active || state.tts_active))
     {
       if (robot_proactive_is_music_event(event->type))
@@ -279,6 +284,7 @@ static void robot_proactive_process(const struct robot_event_s *event)
     {
       printf("[ROBOT-PROACTIVE] inbound failed id=%u rc=%d\n",
              event->id, ret);
+      if (music) robot_proactive_defer_music(event, "inbound-retry");
     }
   else
     {
@@ -289,73 +295,16 @@ static void robot_proactive_process(const struct robot_event_s *event)
 static void robot_proactive_try_pending_music(void)
 {
   struct robot_event_s event;
-  struct robot_world_state_s state;
-  uint64_t now_ms;
-  bool stale;
-  bool eligible;
-
+  bool have_event = false;
   pthread_mutex_lock(&g_proactive.lock);
   if (g_proactive.pending_music_valid)
     {
       event = g_proactive.pending_music;
-    }
-  else
-    {
-      pthread_mutex_unlock(&g_proactive.lock);
-      return;
-    }
-  pthread_mutex_unlock(&g_proactive.lock);
-
-  if (robot_world_state_snapshot(&state) < 0 || !state.initialized ||
-      !state.proactive_enabled || state.conversation_active ||
-      state.motion_active || state.tts_active)
-    {
-      return;
-    }
-
-  now_ms = robot_proactive_monotonic_ms();
-  stale = event.created_ms != 0 && now_ms >= event.created_ms &&
-          now_ms - event.created_ms > ROBOT_PROACTIVE_EVENT_FRESHNESS_MS;
-  eligible = !stale &&
-             (state.last_proactive_ms == 0 ||
-              now_ms - state.last_proactive_ms >= ROBOT_PROACTIVE_COOLDOWN_MS) &&
-             (state.last_event_type_ms[event.type] == 0 ||
-              now_ms - state.last_event_type_ms[event.type] >=
-                ROBOT_PROACTIVE_MUSIC_COOLDOWN_MS);
-  if (!eligible)
-    {
-      if (stale)
-        {
-          robot_proactive_drop(&event, "pending-stale");
-          pthread_mutex_lock(&g_proactive.lock);
-          if (g_proactive.pending_music_valid &&
-              g_proactive.pending_music.id == event.id)
-            {
-              g_proactive.pending_music_valid = false;
-            }
-          pthread_mutex_unlock(&g_proactive.lock);
-        }
-      return;
-    }
-
-  pthread_mutex_lock(&g_proactive.lock);
-  if (g_proactive.pending_music_valid &&
-      g_proactive.pending_music.id == event.id)
-    {
       g_proactive.pending_music_valid = false;
-      eligible = true;
-    }
-  else
-    {
-      eligible = false;
+      have_event = true;
     }
   pthread_mutex_unlock(&g_proactive.lock);
-
-  if (eligible)
-    {
-      printf("[ROBOT-PROACTIVE] dispatch deferred music id=%u\n", event.id);
-      robot_proactive_process(&event);
-    }
+  if (have_event) robot_proactive_process(&event);
 }
 
 static void *robot_proactive_worker(void *arg)
@@ -457,6 +406,9 @@ int robot_proactive_start(void)
   ret = pthread_attr_init(&attr);
   if (ret != 0)
     {
+      pthread_mutex_lock(&g_proactive.lock);
+      g_proactive.started = false;
+      pthread_mutex_unlock(&g_proactive.lock);
       return -ret;
     }
   ret = pthread_attr_setstacksize(&attr, ROBOT_PROACTIVE_STACK_SIZE);
@@ -501,6 +453,7 @@ int robot_proactive_post_ex(enum robot_event_type_e type, const char *source,
 {
   struct robot_event_s *event;
   uint32_t event_id;
+  bool pending = false;
 
   if (type < 0 || type >= ROBOT_EVENT_TYPE_COUNT)
     {
@@ -508,7 +461,9 @@ int robot_proactive_post_ex(enum robot_event_type_e type, const char *source,
     }
 
   pthread_mutex_lock(&g_proactive.lock);
-  if (!g_proactive.initialized || g_proactive.count >= ROBOT_PROACTIVE_QUEUE_DEPTH)
+  if (!g_proactive.initialized ||
+      (g_proactive.count >= ROBOT_PROACTIVE_QUEUE_DEPTH &&
+       !robot_proactive_is_music_event(type)))
     {
       pthread_mutex_unlock(&g_proactive.lock);
       printf("[ROBOT-EVENT] drop type=%s reason=queue-full-or-uninitialized\n",
@@ -516,7 +471,8 @@ int robot_proactive_post_ex(enum robot_event_type_e type, const char *source,
       return -EAGAIN;
     }
 
-  event = &g_proactive.queue[g_proactive.tail];
+  pending = g_proactive.count >= ROBOT_PROACTIVE_QUEUE_DEPTH;
+  event = pending ? &g_proactive.pending_music : &g_proactive.queue[g_proactive.tail];
   memset(event, 0, sizeof(*event));
   event->id = g_proactive.next_event_id++;
   event->type = type;
@@ -533,8 +489,12 @@ int robot_proactive_post_ex(enum robot_event_type_e type, const char *source,
     {
       event->payload = *payload;
     }
-  g_proactive.tail = (g_proactive.tail + 1) % ROBOT_PROACTIVE_QUEUE_DEPTH;
-  g_proactive.count++;
+  if (pending) g_proactive.pending_music_valid = true;
+  else
+    {
+      g_proactive.tail = (g_proactive.tail + 1) % ROBOT_PROACTIVE_QUEUE_DEPTH;
+      g_proactive.count++;
+    }
   event_id = event->id;
   pthread_cond_signal(&g_proactive.cond);
   pthread_mutex_unlock(&g_proactive.lock);
@@ -549,49 +509,39 @@ int robot_proactive_post(enum robot_event_type_e type, const char *detail)
   return robot_proactive_post_ex(type, "manual", detail, NULL);
 }
 
-int robot_proactive_music_update(enum robot_music_state_e music_state,
-                                 const char *track, const char *category,
-                                 const char *mood, uint16_t tempo_bpm)
+int robot_proactive_music_session_update(enum robot_music_state_e music_state,
+  uint32_t session_id, const char *track, const char *category,
+  const char *mood, uint16_t tempo_bpm)
 {
   struct robot_world_state_s before;
   struct robot_event_payload_s payload;
   enum robot_event_type_e type;
   bool changed = false;
   int ret;
-
-  if (robot_world_state_snapshot(&before) < 0)
-    {
-      return -EAGAIN;
-    }
-  ret = robot_world_state_update_music(music_state, track, category, mood,
-                                       tempo_bpm, &changed);
-  if (ret < 0 || !changed)
-    {
-      return ret;
-    }
-
-  if (music_state == ROBOT_MUSIC_PLAYING)
-    {
-      type = before.music_playing ? ROBOT_EVENT_MUSIC_CHANGED :
-                                    ROBOT_EVENT_MUSIC_STARTED;
-    }
-  else
-    {
-      type = ROBOT_EVENT_MUSIC_STOPPED;
-    }
-
+  if (robot_world_state_snapshot(&before) < 0) return -EAGAIN;
+  ret = robot_world_state_update_music_session(music_state, session_id,
+    track, category, mood, tempo_bpm, &changed);
+  if (ret < 0 || !changed) return ret;
+  type = music_state == ROBOT_MUSIC_PLAYING ?
+    (before.music_playing ? ROBOT_EVENT_MUSIC_CHANGED : ROBOT_EVENT_MUSIC_STARTED) :
+    ROBOT_EVENT_MUSIC_STOPPED;
+  if (type == ROBOT_EVENT_MUSIC_STOPPED)
+    (void)robot_expression_clear(ROBOT_EXPRESSION_SOURCE_AGENT);
   memset(&payload, 0, sizeof(payload));
   payload.kind = ROBOT_EVENT_PAYLOAD_MUSIC;
   payload.data.music.state = music_state;
+  payload.data.music.session_id = session_id;
   payload.data.music.tempo_bpm = tempo_bpm;
-  strncpy(payload.data.music.track, track != NULL ? track : "",
-          sizeof(payload.data.music.track) - 1);
-  strncpy(payload.data.music.category, category != NULL ? category : "",
-          sizeof(payload.data.music.category) - 1);
-  strncpy(payload.data.music.mood, mood != NULL ? mood : "",
-          sizeof(payload.data.music.mood) - 1);
-  return robot_proactive_post_ex(type, "music", "music state changed",
-                                 &payload);
+  snprintf(payload.data.music.track, sizeof(payload.data.music.track), "%s", track != NULL ? track : "");
+  snprintf(payload.data.music.category, sizeof(payload.data.music.category), "%s", category != NULL ? category : "");
+  snprintf(payload.data.music.mood, sizeof(payload.data.music.mood), "%s", mood != NULL ? mood : "");
+  return robot_proactive_post_ex(type, "music-dma", "confirmed playback transition", &payload);
+}
+
+int robot_proactive_music_update(enum robot_music_state_e music_state,
+  const char *track, const char *category, const char *mood, uint16_t tempo_bpm)
+{
+  return robot_proactive_music_session_update(music_state, 0, track, category, mood, tempo_bpm);
 }
 
 int robot_proactive_set_enabled(bool enabled)

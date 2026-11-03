@@ -1,31 +1,7 @@
-# robot_voice
+# robot_voice：Agent 音乐使用 OpenVela Media
 
-Independent contest-board MiMo voice application. It does not include or
-modify `packages/ai_agent` voice code. The application uses the original
-public `vela_https_request()` transport ABI and contest-owned capture,
-protocol, WAV/Base64, and I2S playback modules. The normal voice path sends
-ASR text through the existing ai_agent message bus, so the original LLM,
-tools, history, and outbound voice dispatch remain the single shared path.
+当前音乐修复和安装说明见 [`README_AGENT_NATIVE_MEDIA.md`](README_AGENT_NATIVE_MEDIA.md)。
 
-## Commands
+包内 `robot_voice/` 是应用模块，`src/` 是本轮上传的板级源码。Agent 音乐只调用 OpenVela Media 的 open、prepare、start；本地 HTTP/MP3 回退已移除。
 
-```text
-robot_voice set_key <api_key>
-robot_voice test_capture
-robot_voice test_asr
-robot_voice test_llm <text>
-robot_voice test_tts <text>
-robot_voice once
-robot_voice diag
-```
-
-`set_key` writes the same config key used by `set_llm`; normally configure the
-key with `vela> set_llm ... <api_key>` instead. Capture is 16 kHz, mono,
-signed PCM16 for three seconds. MiMo TTS is requested as 24 kHz mono PCM16
-WAV; playback duplicates each source sample into left and right I2S slots at
-24 kHz.
-
-For the shared Vela voice ABI, select `mimo-v2.5-asr` and
-`mimo-v2.5-tts`, then use `voice_start`/`voice_stop` for continuous capture.
-The `robot_voice once` diagnostic performs one capture and publishes the ASR
-text to the same bus; it does not create a second LLM agent.
+这是源码模块包，不含完整 OpenVela SDK、Agent 外部源码或固件。安装前清理旧对象并完整重编译，尤其要重编译 Agent 的 `tool_media.c`。主机桥接、原生路由、构建策略和 Media 生命周期回归已通过；未连接板卡验收。
