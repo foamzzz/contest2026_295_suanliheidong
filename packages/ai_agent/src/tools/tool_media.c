@@ -20,10 +20,12 @@
 #include "agent_compat.h"
 
 #include <math.h>
+#include <errno.h>
 #include <semaphore.h>
 #include <stdarg.h>
 #include <string.h>
 #include <syslog.h>
+#include <unistd.h>
 
 #include "cJSON.h"
 
@@ -35,6 +37,20 @@
  ****************************************************************************/
 
 #define TAG "AGENT_MUSIC"
+
+/* The contest voice controller owns Wi-Fi recovery. Keep these weak so the
+ * official Agent remains usable on boards that do not link robot_voice. */
+extern int robot_voice_wifi_ensure_connected(unsigned int timeout_ms)
+    __attribute__((weak));
+extern int robot_voice_wifi_reconnect_and_ensure(unsigned int timeout_ms)
+    __attribute__((weak));
+
+/* Optional contest runtime: owns the single network/audio task scope. */
+extern int robot_task_begin(void) __attribute__((weak));
+extern void robot_task_end(void) __attribute__((weak));
+extern void robot_task_end_without_resume(void) __attribute__((weak));
+extern bool robot_music_media_is_active(void) __attribute__((weak));
+extern bool robot_music_media_start_pending(void *) __attribute__((weak));
 
 #define MEDIA_URL_MAX 512
 #define MEDIA_OPTIONS_MAX 256
@@ -73,7 +89,12 @@ typedef struct
     char url[MEDIA_URL_MAX];
     int volume; /* user-facing 0..100 */
     bool exiting; /* module teardown flag */
-    bool is_live_stream; /* rtsp/rtmp → duration not supported */
+    bool stopping; /* stop/close is in progress; reject stale resume */
+    /* Reuse the former is_live_stream byte for live/task policy bits. */
+    unsigned char policy_flags;
+#define MEDIA_IS_LIVE 1u
+#define MEDIA_TASK_HELD 2u
+#define MEDIA_TASK_RESUME 4u
 
     /* Event confirmation via semaphore */
 
@@ -107,6 +128,7 @@ static void media_ctx_init_once(void)
     g_media.session_id = 0;
     g_media.volume = 50;
     g_media.exiting = false;
+    g_media.stopping = false;
     g_media.last_event = 0;
     g_media.last_result = 0;
     g_media_initialized = true;
@@ -159,27 +181,22 @@ static void log_url(const char* url, char* buf, size_t bufsz)
 
 static void force_close_locked(void)
 {
-    if (g_media.handle) {
-        syslog(LOG_INFO, "[%s] Force close session %" PRIu32 "\n",
-            TAG, g_media.session_id);
-        media_player_stop(g_media.handle);
-
-        /* Brief yield to let the player drain its internal queue
-         * before close — prevents "play/resume failed: End of file"
-         * log spam when the player tries to read after EOF. */
-
-        pthread_mutex_unlock(&g_media.lock);
-        usleep(50 * 1000); /* 50ms */
-        pthread_mutex_lock(&g_media.lock);
-
-        if (g_media.handle) {
-            media_player_close(g_media.handle, 0);
-            g_media.handle = NULL;
-        }
-    }
-
+    void *handle = g_media.handle;
+    bool stopped = g_media.state == MEDIA_STATE_COMPLETED ||
+                   g_media.state == MEDIA_STATE_ERROR;
+    g_media.stopping = true;
+    g_media.handle = NULL;
+    g_media.session_id++; /* Invalidate callbacks before dropping the lock. */
     g_media.state = MEDIA_STATE_IDLE;
+    g_media.policy_flags &= (unsigned char)~MEDIA_TASK_RESUME;
     g_media.url[0] = '\0';
+    pthread_mutex_unlock(&g_media.lock);
+    if (handle) {
+        if (!stopped) media_player_stop(handle);
+        media_player_close(handle, 0);
+    }
+    pthread_mutex_lock(&g_media.lock);
+    g_media.stopping = false;
 }
 
 /**
@@ -228,6 +245,7 @@ static void notify_agent(const char* fmt, ...)
     memset(&msg, 0, sizeof(msg));
     strncpy(msg.channel, "system", sizeof(msg.channel) - 1);
     strncpy(msg.chat_id, "media", sizeof(msg.chat_id) - 1);
+    msg.flags = AGENT_MSG_FLAG_INTERNAL_MUSIC | AGENT_MSG_FLAG_NO_TTS;
     msg.content = strdup(buf);
     if (msg.content) {
         if (message_bus_push_inbound(&msg) != OK) {
@@ -314,10 +332,18 @@ static void media_event_cb(void* cookie, int event, int result,
             syslog(LOG_ERR,
                 "[%s] COMPLETED with error result=%d session %" PRIu32 "\n",
                 TAG, result, sid);
-            notify_agent("[music] Playback failed (session %" PRIu32
-                         ", error=%d). Please inform the user that"
-                         " the music could not be played successfully.",
-                sid, result);
+            if (result == -EBUSY) {
+                notify_agent("[music] Playback could not open the network "
+                             "stream (session %" PRIu32 ", error=%d). No "
+                             "audio bytes reached the MP3 decoder; this was "
+                             "a temporary network resource-busy condition, "
+                             "not an unsupported audio format.", sid, result);
+            } else {
+                notify_agent("[music] Playback failed (session %" PRIu32
+                             ", error=%d). Please inform the user that"
+                             " the music could not be played successfully.",
+                    sid, result);
+            }
         }
 
         return;
@@ -376,63 +402,131 @@ static void media_event_cb(void* cookie, int event, int result,
  * Returns -1 on timeout, wrong event, or error result.
  */
 
+static void arm_event_locked(void)
+{
+    while (sem_trywait(&g_media.sem) == 0) { }
+    g_media.last_event = -1;
+    g_media.last_result = 0;
+}
+
 static int wait_event(int expected_event, int timeout_ms)
 {
     struct timespec ts;
-
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += timeout_ms / 1000;
-    ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
+    ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
     if (ts.tv_nsec >= 1000000000L) {
-        ts.tv_sec += 1;
+        ts.tv_sec++;
         ts.tv_nsec -= 1000000000L;
     }
+    for (;;) {
+        if (g_media.last_result < 0 ||
+            g_media.state == MEDIA_STATE_COMPLETED ||
+            g_media.state == MEDIA_STATE_ERROR) return -1;
+        if (g_media.last_event == expected_event) return 0;
+        pthread_mutex_unlock(&g_media.lock);
+        int rc;
+        do { rc = sem_timedwait(&g_media.sem, &ts); } while (rc && errno == EINTR);
+        pthread_mutex_lock(&g_media.lock);
+        if (rc) return -1;
+    }
+}
 
-    /* Clear stale event data */
-
-    g_media.last_event = -1;
-    g_media.last_result = 0;
-
-    /* Release lock so callback can run */
-
+/* Backends may call the callback inline. Never send a command with our
+ * callback's mutex held, and never erase confirmation after sending it. */
+static int player_start_locked(void)
+{
+    void *handle = g_media.handle;
+    arm_event_locked();
     pthread_mutex_unlock(&g_media.lock);
-
-    int ret = sem_timedwait(&g_media.sem, &ts);
-
-    /* Re-acquire lock */
-
+    int rc = media_player_start(handle);
     pthread_mutex_lock(&g_media.lock);
+    return rc;
+}
 
-    if (ret != 0) {
-        syslog(LOG_ERR, "[%s] Timeout waiting for event %d (%d ms)\n",
-            TAG, expected_event, timeout_ms);
-        return -1;
+static int player_pause_locked(void)
+{
+    void *handle = g_media.handle;
+    arm_event_locked();
+    pthread_mutex_unlock(&g_media.lock);
+    int rc = media_player_pause(handle);
+    pthread_mutex_lock(&g_media.lock);
+    return rc;
+}
+
+static int player_seek_locked(unsigned int pos)
+{
+    void *handle = g_media.handle;
+    arm_event_locked();
+    pthread_mutex_unlock(&g_media.lock);
+    int rc = media_player_seek(handle, pos);
+    pthread_mutex_lock(&g_media.lock);
+    return rc;
+}
+
+/* Preserve the existing playback checkpoint in the backend. On unsupported
+ * pause or timeout, close the session rather than let TLS race the stream. */
+static int task_suspend_locked(bool resume)
+{
+    if (!g_media.handle || (g_media.state != MEDIA_STATE_PLAYING &&
+                           g_media.state != MEDIA_STATE_PREPARED)) return OK;
+    int rc = player_pause_locked();
+    if (rc < 0 || wait_event(MEDIA_EVENT_PAUSED, TIMEOUT_PAUSE_MS) != 0) {
+        if (g_media.state == MEDIA_STATE_COMPLETED) return OK;
+        syslog(LOG_ERR, "[%s] Task pause failed; closing music session\n", TAG);
+        force_close_locked();
+        return ERROR;
     }
+    if (resume) g_media.policy_flags |= MEDIA_TASK_RESUME;
+    return OK;
+}
 
-    /* Check if we got the expected event with success result */
+int tool_media_music_busy(void)
+{
+    if (robot_music_media_is_active) return robot_music_media_is_active();
+    if (!g_media_initialized) return 0;
+    pthread_mutex_lock(&g_media.lock);
+    int busy = g_media.stopping || g_media.state == MEDIA_STATE_PLAYING ||
+               g_media.state == MEDIA_STATE_PREPARED;
+    pthread_mutex_unlock(&g_media.lock);
+    return busy;
+}
 
-    if (g_media.last_result < 0) {
-        syslog(LOG_ERR,
-            "[%s] Event %d failed with result %d (expected %d)\n",
-            TAG, g_media.last_event, g_media.last_result,
-            expected_event);
-        return -1;
+int tool_media_task_begin(void)
+{
+    if (robot_task_begin && robot_task_end) return robot_task_begin();
+    media_ctx_init_once();
+    pthread_mutex_lock(&g_media.lock);
+    g_media.policy_flags = (g_media.policy_flags & MEDIA_IS_LIVE) | MEDIA_TASK_HELD;
+    if (g_media.state == MEDIA_STATE_COMPLETED || g_media.state == MEDIA_STATE_ERROR)
+        force_close_locked();
+    int rc = task_suspend_locked(g_media.state == MEDIA_STATE_PLAYING);
+    pthread_mutex_unlock(&g_media.lock);
+    return rc;
+}
+
+void tool_media_task_end(int allow_resume)
+{
+    if (robot_task_begin && robot_task_end) {
+        if (!allow_resume && robot_task_end_without_resume)
+            robot_task_end_without_resume();
+        else
+            robot_task_end();
+        return;
     }
-
-    if (g_media.last_event != expected_event) {
-        syslog(LOG_WARNING,
-            "[%s] Got event %d but expected %d (result=%d)\n",
-            TAG, g_media.last_event, expected_event,
-            g_media.last_result);
-
-        /* Accept it if result is OK — some events may arrive
-         * in slightly different order */
-
-        return 0;
+    if (!g_media_initialized) return;
+    pthread_mutex_lock(&g_media.lock);
+    bool resume = allow_resume && (g_media.policy_flags & MEDIA_TASK_RESUME) &&
+                  g_media.state == MEDIA_STATE_PAUSED && !g_media.exiting;
+    g_media.policy_flags &= MEDIA_IS_LIVE;
+    if (resume) {
+        int rc = player_start_locked();
+        if (rc < 0 || wait_event(MEDIA_EVENT_STARTED, TIMEOUT_START_MS) != 0) {
+            syslog(LOG_ERR, "[%s] Task resume failed; closing music session\n", TAG);
+            force_close_locked();
+        }
     }
-
-    syslog(LOG_INFO, "[%s] Event %d confirmed OK\n", TAG, expected_event);
-    return 0;
+    pthread_mutex_unlock(&g_media.lock);
 }
 
 /**
@@ -622,13 +716,13 @@ int tool_music_play_execute(const char* input_json,
 
     /* Set event callback with session_id as cookie */
 
+    pthread_mutex_unlock(&g_media.lock);
     int cb_ret = media_player_set_event_callback(g_media.handle,
-        (void*)(uintptr_t)sid,
-        media_event_cb);
+        (void*)(uintptr_t)sid, media_event_cb);
+    pthread_mutex_lock(&g_media.lock);
     if (cb_ret < 0) {
         syslog(LOG_ERR, "[%s] set_event_callback failed: %d\n", TAG, cb_ret);
-        media_player_close(g_media.handle, 0);
-        g_media.handle = NULL;
+        force_close_locked();
         pthread_mutex_unlock(&g_media.lock);
         cJSON_Delete(root);
         return respond_error(output, output_size,
@@ -637,12 +731,14 @@ int tool_music_play_execute(const char* input_json,
 
     /* Prepare + wait for MEDIA_EVENT_PREPARED */
 
+    arm_event_locked();
+    pthread_mutex_unlock(&g_media.lock);
     int ret = media_player_prepare(g_media.handle, url, options);
+    pthread_mutex_lock(&g_media.lock);
     if (ret < 0) {
         syslog(LOG_ERR, "[%s] media_player_prepare send failed: %d\n",
             TAG, ret);
-        media_player_close(g_media.handle, 0);
-        g_media.handle = NULL;
+        force_close_locked();
         pthread_mutex_unlock(&g_media.lock);
         cJSON_Delete(root);
         return respond_error(output, output_size,
@@ -650,27 +746,10 @@ int tool_music_play_execute(const char* input_json,
     }
 
     if (wait_event(MEDIA_EVENT_PREPARED, TIMEOUT_PREPARE_MS) != 0) {
-        /* Async error from callback — stream is broken, fail hard */
-
-        if (g_media.state == MEDIA_STATE_ERROR) {
-            syslog(LOG_ERR,
-                "[%s] Prepare failed (stream error)\n", TAG);
-            force_close_locked();
-            pthread_mutex_unlock(&g_media.lock);
-            cJSON_Delete(root);
-            return respond_error(output, output_size,
-                "EIO_MEDIA",
-                "Track unavailable (prepare failed). "
-                "Try another song from the search results.");
-        }
-
-        /* Timeout without error — some platforms skip PREPARED event */
-
-        syslog(LOG_WARNING,
-            "[%s] PREPARED event not confirmed within %d ms, "
-            "proceeding anyway (prepare ret was 0)\n",
-            TAG, TIMEOUT_PREPARE_MS);
-        g_media.state = MEDIA_STATE_PREPARED;
+        force_close_locked();
+        pthread_mutex_unlock(&g_media.lock);
+        cJSON_Delete(root);
+        return respond_error(output, output_size, "EIO_MEDIA", "Music prepare not confirmed");
     }
 
     /* State is now PREPARED (set by event callback or forced above) */
@@ -679,12 +758,15 @@ int tool_music_play_execute(const char* input_json,
 
     /* Detect live stream for duration_supported semantics */
 
-    g_media.is_live_stream = (strncasecmp(url, "rtsp://", 7) == 0 || strncasecmp(url, "rtmp://", 7) == 0);
+    if (strncasecmp(url, "rtsp://", 7) == 0 || strncasecmp(url, "rtmp://", 7) == 0)
+        g_media.policy_flags |= MEDIA_IS_LIVE;
+    else
+        g_media.policy_flags &= (unsigned char)~MEDIA_IS_LIVE;
 
     /* Pre-seek if requested */
 
     if (start_pos > 0) {
-        ret = media_player_seek(g_media.handle, (unsigned int)start_pos);
+        ret = player_seek_locked((unsigned int)start_pos);
         if (ret >= 0) {
             if (wait_event(MEDIA_EVENT_SEEKED, TIMEOUT_SEEK_MS) != 0) {
                 syslog(LOG_WARNING,
@@ -703,7 +785,7 @@ int tool_music_play_execute(const char* input_json,
     /* Start if autostart + wait for MEDIA_EVENT_STARTED */
 
     if (autostart) {
-        ret = media_player_start(g_media.handle);
+        ret = player_start_locked();
         if (ret < 0) {
             syslog(LOG_ERR, "[%s] media_player_start send failed: %d\n",
                 TAG, ret);
@@ -714,15 +796,16 @@ int tool_music_play_execute(const char* input_json,
                 "EIO_MEDIA", "media_player_start failed");
         }
 
-        if (wait_event(MEDIA_EVENT_STARTED, TIMEOUT_START_MS) != 0) {
-            /* Same as PREPARED — on some hardware the event callback
-             * never fires.  If start() returned 0, assume it worked. */
-
-            syslog(LOG_WARNING,
-                "[%s] STARTED event not confirmed within %d ms, "
-                "proceeding anyway (start ret was 0)\n",
-                TAG, TIMEOUT_START_MS);
-            g_media.state = MEDIA_STATE_PLAYING;
+        bool staged = robot_music_media_start_pending &&
+                      robot_music_media_start_pending(g_media.handle);
+        if (staged) {
+            g_media.state = MEDIA_STATE_PREPARED;
+            syslog(LOG_INFO, "[%s] Music staged until task/reply completes\n", TAG);
+        } else if (wait_event(MEDIA_EVENT_STARTED, TIMEOUT_START_MS) != 0) {
+            force_close_locked();
+            pthread_mutex_unlock(&g_media.lock);
+            cJSON_Delete(root);
+            return respond_error(output, output_size, "EIO_MEDIA", "Music start not confirmed");
         }
 
         /* State is now PLAYING (set by event callback or forced above) */
@@ -730,8 +813,7 @@ int tool_music_play_execute(const char* input_json,
         /* Fallback seek after start if pre-seek was not done */
 
         if (start_pos > 0) {
-            ret = media_player_seek(g_media.handle,
-                (unsigned int)start_pos);
+            ret = player_seek_locked((unsigned int)start_pos);
             if (ret >= 0) {
                 /* Best-effort, don't fail the whole play for this */
 
@@ -740,13 +822,24 @@ int tool_music_play_execute(const char* input_json,
         }
     }
 
+    if (g_media.policy_flags & MEDIA_TASK_HELD) {
+        if (task_suspend_locked(autostart) != OK) {
+            pthread_mutex_unlock(&g_media.lock);
+            cJSON_Delete(root);
+            return respond_error(output, output_size, "EIO_MEDIA", "Music could not yield resources");
+        }
+    }
+
     /* Build response */
 
     char extra[256];
     snprintf(extra, sizeof(extra),
         "\"session_id\":%" PRIu32 ",\"url\":\"%s\","
-        "\"start_position_ms\":%d",
-        sid, url, start_pos);
+        "\"start_position_ms\":%d,\"resume_pending\":%s",
+        sid, url, start_pos,
+        ((g_media.policy_flags & MEDIA_TASK_RESUME) ||
+         (robot_music_media_start_pending && robot_music_media_start_pending(g_media.handle)))
+         ? "true" : "false");
 
     int rc = respond_ok_state(output, output_size, extra);
 
@@ -766,6 +859,7 @@ int tool_music_pause_execute(const char* input_json,
     media_ctx_init_once();
 
     pthread_mutex_lock(&g_media.lock);
+    g_media.policy_flags &= (unsigned char)~MEDIA_TASK_RESUME;
 
     if (g_media.state == MEDIA_STATE_PAUSED) {
         int rc = respond_ok_state(output, output_size, "\"noop\":true");
@@ -773,17 +867,20 @@ int tool_music_pause_execute(const char* input_json,
         return rc;
     }
 
-    if (g_media.state != MEDIA_STATE_PLAYING) {
+    if (g_media.state != MEDIA_STATE_PLAYING &&
+        !(g_media.state == MEDIA_STATE_PREPARED && robot_music_media_start_pending &&
+          robot_music_media_start_pending(g_media.handle))) {
         pthread_mutex_unlock(&g_media.lock);
         return respond_error(output, output_size,
             "EINVAL_STATE",
-            "Cannot pause: not playing");
+            "Cannot pause: not playing or staged");
     }
 
-    int ret = media_player_pause(g_media.handle);
+    int ret = player_pause_locked();
     if (ret < 0) {
         syslog(LOG_ERR, "[%s] media_player_pause send failed: %d\n",
             TAG, ret);
+        force_close_locked();
         pthread_mutex_unlock(&g_media.lock);
         return respond_error(output, output_size,
             "EIO_MEDIA", "media_player_pause failed");
@@ -791,6 +888,7 @@ int tool_music_pause_execute(const char* input_json,
 
     if (wait_event(MEDIA_EVENT_PAUSED, TIMEOUT_PAUSE_MS) != 0) {
         syslog(LOG_ERR, "[%s] Pause not confirmed\n", TAG);
+        force_close_locked();
         pthread_mutex_unlock(&g_media.lock);
         return respond_error(output, output_size,
             "EIO_MEDIA",
@@ -817,6 +915,12 @@ int tool_music_resume_execute(const char* input_json,
 
     pthread_mutex_lock(&g_media.lock);
 
+    if (g_media.stopping) {
+        pthread_mutex_unlock(&g_media.lock);
+        return respond_error(output, output_size,
+            "EBUSY_MEDIA", "Cannot resume while music is stopping");
+    }
+
     if (g_media.state == MEDIA_STATE_PLAYING) {
         int rc = respond_ok_state(output, output_size, "\"noop\":true");
         pthread_mutex_unlock(&g_media.lock);
@@ -830,13 +934,27 @@ int tool_music_resume_execute(const char* input_json,
             "Cannot resume: not paused or prepared");
     }
 
-    int ret = media_player_start(g_media.handle);
+    if (g_media.policy_flags & MEDIA_TASK_HELD) {
+        g_media.policy_flags |= MEDIA_TASK_RESUME;
+        int rc = respond_ok_state(output, output_size, "\"resume_pending\":true");
+        pthread_mutex_unlock(&g_media.lock);
+        return rc;
+    }
+
+    int ret = player_start_locked();
     if (ret < 0) {
         syslog(LOG_ERR, "[%s] media_player_start (resume) send failed: %d\n",
             TAG, ret);
         pthread_mutex_unlock(&g_media.lock);
         return respond_error(output, output_size,
             "EIO_MEDIA", "media_player_start failed");
+    }
+
+    if (robot_music_media_start_pending && robot_music_media_start_pending(g_media.handle)) {
+        g_media.state = MEDIA_STATE_PREPARED;
+        int rc = respond_ok_state(output, output_size, "\"resume_pending\":true");
+        pthread_mutex_unlock(&g_media.lock);
+        return rc;
     }
 
     if (wait_event(MEDIA_EVENT_STARTED, TIMEOUT_START_MS) != 0) {
@@ -866,6 +984,7 @@ int tool_music_stop_execute(const char* input_json,
     media_ctx_init_once();
 
     pthread_mutex_lock(&g_media.lock);
+    g_media.policy_flags &= (unsigned char)~MEDIA_TASK_RESUME;
 
     if (g_media.state == MEDIA_STATE_IDLE) {
         int rc = respond_ok_state(output, output_size, "\"noop\":true");
@@ -876,14 +995,10 @@ int tool_music_stop_execute(const char* input_json,
     syslog(LOG_INFO, "[%s] Stop session %" PRIu32 "\n",
         TAG, g_media.session_id);
 
-    if (g_media.handle && g_media.state != MEDIA_STATE_ERROR) {
-        int ret = media_player_stop(g_media.handle);
-        if (ret >= 0) {
-            /* Best-effort wait — even if timeout, we still close */
-
-            wait_event(MEDIA_EVENT_STOPPED, TIMEOUT_STOP_MS);
-        }
-    }
+    /* Set the gate before sending STOP.  Media callbacks can arrive on a
+     * separate thread and must not make the session look resumable while the
+     * close sequence is draining I2S and releasing its handle. */
+    g_media.stopping = true;
 
     /* Always force close to ensure clean state */
 
@@ -932,7 +1047,7 @@ int tool_music_seek_execute(const char* input_json,
             "Cannot seek in current state");
     }
 
-    int ret = media_player_seek(g_media.handle, (unsigned int)pos);
+    int ret = player_seek_locked((unsigned int)pos);
     if (ret < 0) {
         syslog(LOG_ERR, "[%s] media_player_seek send failed: %d\n",
             TAG, ret);
@@ -1041,23 +1156,24 @@ int tool_music_status_execute(const char* input_json,
 
     unsigned int position_ms = 0;
     unsigned int duration_ms = 0;
-    bool duration_supported = !g_media.is_live_stream;
+    bool duration_supported = !(g_media.policy_flags & MEDIA_IS_LIVE);
     bool duration_ok = false;
     bool position_ok = false;
 
-    if (g_media.handle && st != MEDIA_STATE_IDLE && st != MEDIA_STATE_ERROR) {
-        if (media_player_get_position(g_media.handle, &position_ms) == 0) {
-            position_ok = true;
-        }
-
-        if (media_player_get_duration(g_media.handle, &duration_ms) == 0) {
-            duration_ok = true;
-        }
+    void *handle = g_media.handle;
+    pthread_mutex_unlock(&g_media.lock);
+    if (handle && st != MEDIA_STATE_IDLE && st != MEDIA_STATE_ERROR) {
+        position_ok = media_player_get_position(handle, &position_ms) == 0;
+        duration_ok = media_player_get_duration(handle, &duration_ms) == 0;
     }
+    pthread_mutex_lock(&g_media.lock);
+    if (handle != g_media.handle) position_ok = duration_ok = false;
 
     cJSON* resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "ok", true);
     cJSON_AddStringToObject(resp, "state", state_str(st));
+    cJSON_AddBoolToObject(resp, "resume_pending", (g_media.policy_flags & MEDIA_TASK_RESUME) != 0 ||
+        (robot_music_media_start_pending && robot_music_media_start_pending(g_media.handle)));
 
     if (st != MEDIA_STATE_IDLE) {
         cJSON_AddStringToObject(resp, "url", g_media.url);
@@ -1121,8 +1237,42 @@ void tool_media_cleanup(void)
  * Music Search (Netease Cloud Music API)
  ****************************************************************************/
 
-#define SEARCH_RESP_SIZE 8192
+#define SEARCH_RESP_SIZE 16384
 #define SEARCH_MAX_RESULTS 5
+#define MUSIC_SEARCH_ATTEMPTS 3
+#define MUSIC_SEARCH_NET_TIMEOUT_MS 5000
+
+static void music_search_prepare_retry(unsigned int attempt,
+    bool force_reconnect)
+{
+    /* The voice HTTP pool and vela_tls pool are separate. Retire both idle
+     * pools before retrying so a request after voice_stop cannot inherit a
+     * socket invalidated by the previous Wi-Fi/TLS session. */
+    if (attempt > 0) {
+        vela_tls_pool_cleanup();
+    }
+
+    if (robot_voice_wifi_ensure_connected != NULL) {
+        int ret = robot_voice_wifi_ensure_connected(
+            MUSIC_SEARCH_NET_TIMEOUT_MS);
+        if (ret < 0) {
+            syslog(LOG_WARNING,
+                "[%s] search network gate attempt=%u rc=%d\n",
+                TAG, attempt + 1, ret);
+        }
+    }
+
+    /* A failed handshake can leave DHCP up while the WLAN/TLS path is stale.
+     * Force one saved-credential reconnect only after the first failed try. */
+    if (force_reconnect && robot_voice_wifi_reconnect_and_ensure != NULL) {
+        int ret = robot_voice_wifi_reconnect_and_ensure(
+            MUSIC_SEARCH_NET_TIMEOUT_MS);
+        if (ret < 0) {
+            syslog(LOG_WARNING,
+                "[%s] search forced network recovery rc=%d\n", TAG, ret);
+        }
+    }
+}
 
 static void url_encode(const char* src, char* dst, size_t dstsz)
 {
@@ -1176,8 +1326,68 @@ int tool_music_search_execute(const char* input_json,
         return -1;
     }
 
-    int status = vela_https_get("music.163.com", "443", path,
-        resp, SEARCH_RESP_SIZE);
+    static const vela_header_t search_headers[] = {
+        { "Accept", "application/json" },
+        { "Accept-Encoding", "identity" },
+        { "Referer", "https://music.163.com/" },
+        /* Search responses are small and one-shot. Do not return a possibly
+         * truncated body to the shared keep-alive pool. */
+        { "Connection", "close" },
+        { NULL, NULL },
+    };
+    int status = VELA_TLS_ERR_READ;
+    size_t body_len = 0;
+    cJSON* j = NULL;
+    bool force_reconnect = false;
+
+    for (unsigned int attempt = 0; attempt < MUSIC_SEARCH_ATTEMPTS;
+         attempt++) {
+        if (attempt > 0) {
+            music_search_prepare_retry(attempt, force_reconnect);
+            force_reconnect = false;
+            usleep(250 * 1000);
+        } else if (robot_voice_wifi_ensure_connected != NULL) {
+            music_search_prepare_retry(0, false);
+        }
+
+        memset(resp, 0, SEARCH_RESP_SIZE);
+        body_len = 0;
+        status = vela_https_request("music.163.com", "443", "GET", path,
+            search_headers, NULL, 0, resp, SEARCH_RESP_SIZE, &body_len);
+
+        if (status != 200) {
+            if (status < 0 && attempt + 1 < MUSIC_SEARCH_ATTEMPTS) {
+                force_reconnect = attempt == 0;
+                syslog(LOG_WARNING,
+                    "[%s] search request attempt=%u failed rc=%d; retrying\n",
+                    TAG, attempt + 1, status);
+                continue;
+            }
+            break;
+        }
+
+        if (body_len == 0 || resp[0] == '\0') {
+            syslog(LOG_WARNING,
+                "[%s] search HTTP 200 with empty body attempt=%u\n",
+                TAG, attempt + 1);
+        } else {
+            j = cJSON_Parse(resp);
+            if (j != NULL) {
+                break;
+            }
+            syslog(LOG_WARNING,
+                "[%s] search JSON parse failed attempt=%u body=%zu; retrying\n",
+                TAG, attempt + 1, body_len);
+        }
+
+        if (attempt + 1 < MUSIC_SEARCH_ATTEMPTS) {
+            /* The response may have been truncated or the pooled stream may
+             * contain a partial body. The next attempt must use a new TLS
+             * connection instead of the same stream. */
+            vela_tls_pool_cleanup();
+            continue;
+        }
+    }
     cJSON_Delete(root);
 
     if (status != 200) {
@@ -1186,10 +1396,10 @@ int tool_music_search_execute(const char* input_json,
         return -1;
     }
 
-    cJSON* j = cJSON_Parse(resp);
     free(resp);
     if (!j) {
-        snprintf(output, output_size, "Error: bad JSON from server");
+        snprintf(output, output_size,
+            "Error: bad JSON from server (body=%zu)", body_len);
         return -1;
     }
 

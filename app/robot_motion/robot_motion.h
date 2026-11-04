@@ -137,6 +137,10 @@ bool robot_motion_is_busy(void);
 enum robot_motion_state_e robot_motion_get_state(void);
 int robot_motion_get_active(struct robot_motion_request_s *request);
 
+/* Cancel/drain only the current music-tail request before a foreground task.
+ * Reuses the motion worker's existing mutex/condition variable. */
+int robot_motion_quiesce_music(void);
+
 #ifdef __cplusplus
 }
 #endif

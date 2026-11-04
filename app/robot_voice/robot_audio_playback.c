@@ -105,7 +105,7 @@ extern int robot_oled_set_loading(bool loading) __attribute__((weak));
  * Ring-buffer values from tts_pcm_playback_guide.md:
  *
  *   Music Ring      = 2 MiB (PSRAM jitter cushion)
- *   Music Prebuffer = 192 KiB; voice SSE prebuffer = 24 KiB
+ *   Music Prebuffer = 512 KiB; voice SSE prebuffer = 24 KiB
  *   Rebuffer        =  48 KiB (legacy threshold; F7I does not rebuffer once PLAYING)
  *
  * The worker waits in PREBUFFER while PCM arrives. Cached voice waits for
@@ -125,7 +125,7 @@ extern int robot_oled_set_loading(bool loading) __attribute__((weak));
 #  define RV_RING_BYTES             (512 * 1024)
 #  define RV_START_PREBUFFER_BYTES  (128 * 1024)
 #  define RV_MUSIC_RING_BYTES       (4 * 1024 * 1024)
-#  define RV_MUSIC_START_PREBUFFER_BYTES (1024 * 1024)
+#  define RV_MUSIC_START_PREBUFFER_BYTES (512 * 1024)
 #endif
 #define RV_REBUFFER_BYTES           (48 * 1024)
 /* Native Media's URL input is bursty. Keep the large music ring for jitter
@@ -354,6 +354,26 @@ static int rv_get_result(struct rv_playback_s *pb)
   value = pb->i2s_result;
   rv_unlock(pb);
   return value;
+}
+
+/* The task owner can cancel while the playback worker reaches EOS. Reuse
+ * i2s_started's existing word: -1 marks STOP in progress, avoiding duplicate
+ * driver STOP calls or reading a checkpoint before its callbacks finish. */
+static void rv_stop_i2s(struct rv_playback_s *pb)
+{
+  int started = 1;
+  if (pb->i2s == NULL) return;
+  if (__atomic_compare_exchange_n(&pb->i2s_started, &started, -1, false,
+                                  __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    {
+      I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+      __atomic_store_n(&pb->i2s_started, 0, __ATOMIC_RELEASE);
+    }
+  else
+    {
+      while (__atomic_load_n(&pb->i2s_started, __ATOMIC_ACQUIRE) == -1)
+        usleep(100);
+    }
 }
 
 static int rv_ring_write(struct rv_playback_s *pb,
@@ -1228,8 +1248,7 @@ static void *rv_worker(void *arg)
 
                   if (pb->i2s != NULL && pb->i2s_started)
                     {
-                      pb->i2s_started = 0;
-                      I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+                      rv_stop_i2s(pb);
                     }
 
                   rv_signal_all(pb);
@@ -1298,8 +1317,7 @@ static void *rv_worker(void *arg)
 
           if (pb->i2s != NULL && pb->i2s_started)
             {
-              pb->i2s_started = 0;
-              I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+              rv_stop_i2s(pb);
             }
 
           rv_signal_all(pb);
@@ -1596,8 +1614,7 @@ static int rv_start_i2s_playback(struct rv_playback_s *pb)
 fail_started:
   if (pb->i2s_started)
     {
-      pb->i2s_started = 0;
-      I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+      rv_stop_i2s(pb);
     }
 
 fail:
@@ -2095,8 +2112,7 @@ int robot_audio_playback_finish(void)
 
   if (pb->i2s != NULL && pb->i2s_started)
     {
-      pb->i2s_started = 0;
-      I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+      rv_stop_i2s(pb);
     }
 
   pb->finished = 1;
@@ -2146,6 +2162,26 @@ int robot_audio_playback_finish(void)
   return ret;
 }
 
+uint64_t robot_audio_playback_cancel(void)
+{
+  struct rv_playback_s *pb = &g_pb;
+  uint64_t completed = 0;
+  if (!pb->opened) return 0;
+  pb->stopped = 1;
+  rv_signal_all(pb);
+  if (pb->i2s != NULL && pb->i2s_started)
+    {
+      rv_stop_i2s(pb);
+      rv_signal_all(pb);
+    }
+  if (rv_lock(pb) >= 0)
+    {
+      completed = pb->completed_source_bytes;
+      rv_unlock(pb);
+    }
+  return completed;
+}
+
 void robot_audio_playback_close(void)
 {
   struct rv_playback_s *pb = &g_pb;
@@ -2162,8 +2198,7 @@ void robot_audio_playback_close(void)
 
       if (pb->i2s != NULL && pb->i2s_started)
         {
-          pb->i2s_started = 0;
-          I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+          rv_stop_i2s(pb);
           rv_signal_all(pb);
         }
 
@@ -2175,8 +2210,7 @@ void robot_audio_playback_close(void)
 
   if (pb->i2s != NULL && pb->i2s_started)
     {
-      pb->i2s_started = 0;
-      I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+      rv_stop_i2s(pb);
     }
 
   if (!pb->finished)

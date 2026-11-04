@@ -110,6 +110,7 @@ static bool heartbeat_send(void)
         return false;
     }
 
+    msg.flags |= AGENT_MSG_FLAG_DEFER_MUSIC;
     int err = message_bus_push_inbound(&msg);
     if (err != OK) {
         syslog(LOG_WARNING, "[%s] Failed to push heartbeat message: %s\n", TAG, strerror(errno));

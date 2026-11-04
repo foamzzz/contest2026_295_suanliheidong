@@ -25,6 +25,8 @@ extern "C"
 #define ROBOT_PROACTIVE_MUSIC_COOLDOWN_MS (10ULL * 1000ULL)
 
 int robot_proactive_init(void);
+/* Local Agent dispatch for a structured confirmed music event. No LLM/TTS. */
+int robot_proactive_apply_music_skill(const char *content);
 int robot_proactive_start(void);
 int robot_proactive_stop(void);
 int robot_proactive_post(enum robot_event_type_e type, const char *detail);

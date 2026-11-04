@@ -394,6 +394,8 @@ static void* outbound_dispatch_task(void* arg)
 
         if (!msg.content) {
             syslog(LOG_WARNING, "[%s] Skip outbound message with NULL content\n", TAG);
+            message_bus_reply_complete(&msg);
+            message_bus_msg_free(&msg);
             continue;
         }
 
@@ -401,7 +403,8 @@ static void* outbound_dispatch_task(void* arg)
 
         /* Let registered taps intercept before normal dispatch */
         if (mbus_tap_try_deliver(&msg)) {
-            free(msg.content);
+            message_bus_reply_complete(&msg);
+            message_bus_msg_free(&msg);
             continue;
         }
 
@@ -503,7 +506,8 @@ static void* outbound_dispatch_task(void* arg)
             syslog(LOG_WARNING, "[%s] Unknown channel: %s\n", TAG, msg.channel);
         }
 
-        free(msg.content);
+        message_bus_reply_complete(&msg);
+        message_bus_msg_free(&msg);
     }
 
     syslog(LOG_INFO, "[%s] Outbound dispatch exiting\n", TAG);

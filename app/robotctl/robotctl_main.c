@@ -156,7 +156,6 @@ static int robotctl_single_servo(int argc, char *argv[])
          ctx.angle[servo], angle);
   ret = robotctl_servo_move_one(
     &ctx, servo, angle,
-    servo == ROBOTCTL_TAIL ? 20 :
     robot_motion_limb_interval(ROBOT_MOTION_DEFAULT_WALK_PERIOD), 200);
   robotctl_servo_close(&ctx);
   return ret;

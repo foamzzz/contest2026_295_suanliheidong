@@ -20,7 +20,12 @@ int robot_music_media_get_duration(void *, unsigned int *);
 ssize_t robot_music_media_write_data(void *, const void *, size_t);
 int robot_music_media_set_volume(const char *, int);
 bool robot_music_media_owns_reply(unsigned long);
+bool robot_music_media_start_pending(void *);
 bool robot_music_media_is_active(void);
+bool robot_music_media_has_task(void);
+/* Auto preemption is resumable; user pause/stop never auto-resumes. */
+int robot_music_media_suspend(void);
+int robot_music_media_resume(void);
 #define ROBOT_MUSIC_MOTION_READY_BYTES (64U * 1024U)
 bool robot_music_media_session_ready(uint32_t session_id);
 bool robot_music_media_motion_allowed(uint32_t session_id);

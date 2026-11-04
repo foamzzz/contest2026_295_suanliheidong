@@ -267,12 +267,19 @@ static int robot_motion_tail_interval(unsigned int period_ms)
   return 20;
 }
 
+static int robot_motion_tail_reset_interval(void)
+{
+  return robot_motion_limb_interval(ROBOT_MOTION_DEFAULT_WALK_PERIOD);
+}
+
 static int robot_motion_tail_cooldown_ms(unsigned int period_ms,
                                          unsigned int amplitude_deg)
 {
+  int interval_ms = robot_motion_tail_interval(period_ms);
+
   /* center -> +A -> -A -> center has 4*A one-degree movements. */
   return (int)(period_ms / (4U * amplitude_deg)) -
-         20 - ROBOT_MOTION_TAIL_ENDPOINT_SETTLE_MS;
+         interval_ms - ROBOT_MOTION_TAIL_ENDPOINT_SETTLE_MS;
 }
 
 static int robot_motion_tail_cooldown(int cooldown_ms)
@@ -579,6 +586,7 @@ static int robot_motion_execute_tail_wag(
   const int right = center + (int)request->amplitude_deg;
   const int left = center - (int)request->amplitude_deg;
   int interval_ms = robot_motion_tail_interval(request->period_ms);
+  int reset_interval_ms = robot_motion_tail_reset_interval();
   int cooldown_ms = robot_motion_tail_cooldown_ms(request->period_ms, request->amplitude_deg);
   int ret;
   unsigned int cycle;
@@ -614,7 +622,8 @@ static int robot_motion_execute_tail_wag(
   /* Return through center using only bounded one-degree tail pulses. */
   if (ret >= 0)
     {
-      ret = robot_motion_tail_ramp_to(&ctx, center, interval_ms, cooldown_ms);
+      ret = robot_motion_tail_ramp_to(&ctx, center, reset_interval_ms,
+                                      cooldown_ms);
     }
 
   for (cycle = 0; ret >= 0 && cycle < request->steps; cycle++)
@@ -641,14 +650,14 @@ static int robot_motion_execute_tail_wag(
           printf("[ROBOT-MOTION] tail wag cycle=%u/%u sweep=left->center\n",
                  cycle + 1, request->steps);
           ret = robot_motion_tail_ramp_to(&ctx, center,
-                                          interval_ms, cooldown_ms);
+                                          reset_interval_ms, cooldown_ms);
         }
     }
 
   if (ret >= 0 && ctx.angle[ROBOTCTL_TAIL] != center)
     {
       ret = robot_motion_tail_ramp_to(&ctx, center,
-                                      interval_ms, cooldown_ms);
+                                      reset_interval_ms, cooldown_ms);
     }
 
   if (ret >= 0) ret = robot_motion_tail_cooldown(ROBOT_MOTION_TAIL_OPEN_RECOVERY_MS);
@@ -677,6 +686,8 @@ static int robot_motion_execute_music_tail_step(
     {
       return -EINVAL;
     }
+
+  if (robot_motion_cancel_check(NULL)) return -ECANCELED;
 
   ret = robotctl_servo_open(&ctx);
   if (ret < 0)
@@ -1400,6 +1411,31 @@ int robot_motion_home_sync(void)
   pthread_cond_broadcast(&g_motion.cond);
   pthread_mutex_unlock(&g_motion.lock);
   return ret;
+}
+
+int robot_motion_quiesce_music(void)
+{
+  uint32_t request_id;
+  pthread_mutex_lock(&g_motion.lock);
+  if (g_motion.request.source != ROBOT_MOTION_SOURCE_MUSIC ||
+      (!g_motion.request_pending && g_motion.state != ROBOT_MOTION_STATE_RUNNING)) {
+    pthread_mutex_unlock(&g_motion.lock);
+    return 0;
+  }
+  request_id = g_motion.request.request_id;
+  g_motion.cancel_requested = true;
+  if (g_motion.request_pending) {
+    g_motion.request_pending = false;
+    g_motion.completed_request_id = request_id;
+    g_motion.last_result = -ECANCELED;
+    g_motion.state = ROBOT_MOTION_STATE_IDLE;
+    pthread_cond_broadcast(&g_motion.cond);
+  }
+  pthread_mutex_unlock(&g_motion.lock);
+  /* Reuse the existing monotonic, bounded waiter. Driver stalls must report
+   * failure rather than hold every later conversation indefinitely. */
+  return robot_motion_wait_timeout(request_id,
+    2U * ROBOT_MOTION_MUSIC_TAIL_STEP_MS, NULL);
 }
 
 bool robot_motion_is_busy(void)

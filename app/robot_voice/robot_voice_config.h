@@ -24,7 +24,11 @@
  * Final segments are joined in capture order and
  * dispatched only when the complete user turn has become quiet.
  */
-#define ROBOT_VOICE_ASR_WORKERS       2
+/* All HTTP work is serialized by the shared transport gate. A second ASR
+ * worker only waits there while retaining another 24 KiB task stack, so keep
+ * one request worker and let the existing bounded segment queue preserve
+ * ordering without reserving another stack. Capture/KWS remains independent. */
+#define ROBOT_VOICE_ASR_WORKERS       1
 #define ROBOT_VOICE_ASR_QUEUE         4
 #define ROBOT_VOICE_ASR_INTERVAL_MS   800
 #define ROBOT_VOICE_ASR_BACKOFF_MS    3000

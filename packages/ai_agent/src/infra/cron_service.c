@@ -43,7 +43,7 @@ static void cron_generate_id(char* id_buf);
 static int cron_load_jobs(void);
 static int cron_save_jobs(void);
 static int cron_parse_job_item(cJSON* item, cron_job_t* job);
-static void cron_fire_job(cron_job_t* job, time_t now);
+static int cron_fire_job(cron_job_t* job, time_t now);
 static void cron_process_due_jobs(void);
 static void compute_initial_next_run(cron_job_t* job);
 static void* cron_task_main(void* arg);
@@ -321,68 +321,36 @@ static int cron_save_jobs(void)
 
 /* -- Due-job processing ------------------------------------------ */
 
-static void cron_fire_job(cron_job_t* job, time_t now)
+static int cron_fire_job(cron_job_t* job, time_t now)
 {
     syslog(LOG_INFO, "[%s] Cron job firing: %s (%s)\n", TAG, job->name, job->id);
 
-    if (job->action[0] != '\0') {
-        /* Direct tool execution — no queue contention with agent loop */
-        char tool_output[512];
-        tool_output[0] = '\0';
-
-        syslog(LOG_INFO, "[%s] Executing action: %s args=%.128s\n",
-            TAG, job->action, job->action_args);
-
-        int err = tool_registry_execute(job->action, job->action_args,
-            tool_output, sizeof(tool_output));
-
-        if (err != OK) {
-            syslog(LOG_WARNING, "[%s] Action %s failed: %s\n",
-                TAG, job->action, tool_output);
-        } else {
-            syslog(LOG_INFO, "[%s] Action %s OK: %.128s\n",
-                TAG, job->action, tool_output);
-        }
-
-        /* Send a notification to the user about what happened.
-         * Skip voice notification when the action itself failed —
-         * speaking the failure message through voice channel can
-         * trigger another round of audio close cascade errors. */
-        if (err != OK
-            && strcmp(job->channel, AGENT_CHAN_VOICE) == 0) {
-            syslog(LOG_WARNING,
-                "[%s] Skipping voice notification for failed action %s\n",
-                TAG, job->action);
-        } else if (job->notify && job->channel[0] != '\0') {
-            agent_msg_t notify;
-            memset(&notify, 0, sizeof(notify));
-            strncpy(notify.channel, job->channel, sizeof(notify.channel) - 1);
-            strncpy(notify.chat_id, job->chat_id, sizeof(notify.chat_id) - 1);
-            notify.content = strdup(job->message);
-            if (notify.content) {
-                if (message_bus_push_outbound(&notify) != OK) {
-                    free(notify.content);
-                }
-            }
-        }
+    agent_msg_t msg = { 0 };
+    strncpy(msg.channel, job->channel, sizeof(msg.channel) - 1);
+    strncpy(msg.chat_id, job->chat_id, sizeof(msg.chat_id) - 1);
+    if (job->action[0]) {
+        cJSON *payload = cJSON_CreateObject();
+        cJSON_AddStringToObject(payload, "tool", job->action);
+        cJSON_AddStringToObject(payload, "args", job->action_args);
+        cJSON_AddStringToObject(payload, "text", job->message);
+        cJSON_AddBoolToObject(payload, "notify", job->notify && job->channel[0]);
+        msg.content = cJSON_PrintUnformatted(payload);
+        cJSON_Delete(payload);
+        msg.flags = AGENT_MSG_FLAG_TOOL_JOB;
+        if (!strcmp(job->action, "music_stop")) msg.flags |= AGENT_MSG_FLAG_MUSIC_STOP;
+        if (!strcmp(job->action, "music_pause")) msg.flags |= AGENT_MSG_FLAG_MUSIC_PAUSE;
     } else {
-        /* Plain reminder — push directly to outbound */
-        agent_msg_t msg;
-        memset(&msg, 0, sizeof(msg));
-        strncpy(msg.channel, job->channel, sizeof(msg.channel) - 1);
-        strncpy(msg.chat_id, job->chat_id, sizeof(msg.chat_id) - 1);
         msg.content = strdup(job->message);
-
-        if (msg.content) {
-            int err = message_bus_push_outbound(&msg);
-            if (err != OK) {
-                syslog(LOG_WARNING, "[%s] Failed to push cron message\n", TAG);
-                free(msg.content);
-            }
-        }
+        msg.flags = AGENT_MSG_FLAG_NOTIFICATION | AGENT_MSG_FLAG_DEFER_MUSIC;
+    }
+    if (!msg.content || message_bus_push_inbound(&msg) != OK) {
+        message_bus_msg_free(&msg);
+        syslog(LOG_WARNING, "[%s] Scheduled task not queued; retry later: %s\n", TAG, job->id);
+        return ERROR;
     }
 
-    job->last_run = now;
+    job->last_run = now; /* Enqueue time; execution belongs to the Agent. */
+    return OK;
 }
 
 static void cron_process_due_jobs(void)
@@ -404,7 +372,7 @@ static void cron_process_due_jobs(void)
             continue;
         }
 
-        cron_fire_job(job, now);
+        if (cron_fire_job(job, now) != OK) continue;
 
         if (job->kind == CRON_KIND_AT) {
             if (job->delete_after_run) {

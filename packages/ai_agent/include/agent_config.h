@@ -171,7 +171,7 @@
 
 /* ── Message Bus ────────────────────────────────────────────── */
 #define AGENT_BUS_QUEUE_LEN 16
-#define AGENT_BUS_OVERFLOW_LEN 32
+#define AGENT_BUS_OVERFLOW_LEN 0 /* Compatibility only; bus uses the fixed ring. */
 #define AGENT_BUS_PUSH_TIMEOUT_MS 5000
 #define AGENT_OUTBOUND_STACK (16 * 1024)
 #define AGENT_OUTBOUND_PRIO 50

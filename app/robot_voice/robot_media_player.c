@@ -23,6 +23,11 @@
 #include <netutils/webclient.h>
 
 #include "robot_audio_playback.h"
+#include "robot_media_player.h"
+#include "robot_task.h"
+
+extern void robot_voice_http_close_idle(void) __attribute__((weak));
+extern void vela_tls_pool_cleanup(void) __attribute__((weak));
 
 #ifdef CONFIG_LIB_HELIX_MP3
 #  include <mp3dec.h>
@@ -34,15 +39,20 @@
 #define RV_MP3_QUEUE_CAP             (64 * 1024)
 #define RV_MP3_QUEUE_CHUNK           2048
 #define RV_HTTP_BUFFER_CAP           8192
-#define RV_HTTP_TIMEOUT_SEC          120
+/* Bound stop/pause even when recv stalls and no sink callback arrives. */
+#define RV_HTTP_TIMEOUT_SEC          1
 #define RV_HTTP_MAX_NO_PROGRESS      4
 #define RV_HTTP_RESUME_DELAY_MS      500
 #define RV_PCM_SAMPLES_CAP           2304
 #define RV_OUTPUT_RATE               24000
 #define RV_EVENT_PREPARED            1
 #define RV_EVENT_STARTED             2
+#define RV_EVENT_PAUSED              3
 #define RV_EVENT_STOPPED             4
 #define RV_EVENT_COMPLETED           6
+#define RV_MEDIA_AUTO_PAUSED          1
+#define RV_MEDIA_USER_PAUSED          2
+#define RV_MEDIA_STAGED               3
 
 /* Music/media software gain: 9/32 amplitude ~= -10.88 dB. */
 #define RV_MUSIC_GAIN_NUM            9
@@ -67,27 +77,19 @@ static unsigned long long rv_media_now_ms(void)
          (unsigned long long)ts.tv_nsec / 1000000ULL;
 }
 
-struct rv_media_event
-{
-  rv_media_event_callback callback;
-  void *cookie;
-  int event;
-  int result;
-};
-
 struct rv_media_player
 {
   pthread_mutex_t lock;
   pthread_t worker;
   bool worker_started;
-  bool worker_done;
+  unsigned char paused; /* running / automatic / user / staged */
   bool stop_requested;
   bool prepared;
   bool started;
   bool url_mode;
   bool playback_open;
   char url[RV_MEDIA_URL_CAP];
-  const char *options;
+  size_t played_bytes; /* replaces unused options pointer; completed PCM only */
   rv_media_event_callback callback;
   void *callback_cookie;
 };
@@ -96,6 +98,29 @@ struct rv_media_player
  * can stop online/Media playback without owning tool_media's private handle. */
 static pthread_mutex_t g_rv_active_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct rv_media_player *g_rv_active_player;
+
+/* A resolved music URL can briefly fail before the first byte is received
+ * while the hotspot DNS/socket state is being restored after voice capture
+ * stops. These errors are safe to retry with the same byte offset. */
+static bool rv_http_retryable(int result)
+{
+  switch (result)
+    {
+      case -EBUSY:
+      case -ENOTCONN:
+      case -ECONNRESET:
+      case -EPIPE:
+      case -ETIMEDOUT:
+      case -EAGAIN:
+      case -ENOENT:
+      case -EHOSTUNREACH:
+      case -ENETUNREACH:
+      case -EADDRNOTAVAIL:
+        return true;
+      default:
+        return false;
+    }
+}
 
 static bool rv_player_stop_requested(struct rv_media_player *player)
 {
@@ -112,68 +137,18 @@ static bool rv_player_stop_requested(struct rv_media_player *player)
   return stop;
 }
 
-static void *rv_event_worker(void *arg)
+/* The upper adapter releases its mutex before commands. Deliver completion
+ * inline instead of allocating a detached thread/stack for each event.
+ * Receivers only record state/enqueue bounded notifications, never join us. */
+static void rv_emit_event(struct rv_media_player *player, int event, int result)
 {
-  struct rv_media_event *event = arg;
-
-  /* robot_legacy_media_prepare/start are called while tool_media holds its lock.
-   * Delivering synchronously would deadlock its callback. */
-  usleep(1000);
-  if (event->callback)
-    {
-      event->callback(event->cookie, event->event, event->result, NULL);
-    }
-
-  free(event);
-  return NULL;
-}
-
-static void rv_emit_event(struct rv_media_player *player, int event,
-                          int result)
-{
-  struct rv_media_event *pending;
-  pthread_t thread;
-  pthread_attr_t attr;
-
+  rv_media_event_callback callback;
+  void *cookie;
   pthread_mutex_lock(&player->lock);
-  if (!player->callback)
-    {
-      pthread_mutex_unlock(&player->lock);
-      return;
-    }
-
-  pending = calloc(1, sizeof(*pending));
-  if (!pending)
-    {
-      pthread_mutex_unlock(&player->lock);
-      syslog(LOG_ERR, "[%s] event allocation failed event=%d\n",
-             RV_MEDIA_TAG, event);
-      return;
-    }
-
-  pending->callback = player->callback;
-  pending->cookie = player->callback_cookie;
-  pending->event = event;
-  pending->result = result;
+  callback = player->callback;
+  cookie = player->callback_cookie;
   pthread_mutex_unlock(&player->lock);
-
-  if (pthread_attr_init(&attr) != 0)
-    {
-      free(pending);
-      return;
-    }
-
-  (void)pthread_attr_setstacksize(&attr, 4096);
-  if (pthread_create(&thread, &attr, rv_event_worker, pending) == 0)
-    {
-      (void)pthread_detach(thread);
-    }
-  else
-    {
-      free(pending);
-    }
-
-  pthread_attr_destroy(&attr);
+  if (callback != NULL) callback(cookie, event, result, NULL);
 }
 
 #ifdef CONFIG_LIB_HELIX_MP3
@@ -184,8 +159,7 @@ struct rv_mp3_decoder
   unsigned char input[RV_MP3_INPUT_CAP];
   size_t input_len;
   int phase;
-  int sample_rate;
-  int channels;
+  size_t skip_pcm; /* reuse unused format fields; rebuild Helix on resume */
   size_t http_bytes;
   size_t stream_offset;
   unsigned long long rate_window_ms;
@@ -237,6 +211,19 @@ static bool rv_mp3_frame_info_valid(const MP3FrameInfo *info)
          info->outputSamps % info->nChans == 0;
 }
 
+/* Replay/discard reconstructs the MP3 bit reservoir and resampler without
+ * retaining a second cache during TTS. Only completed PCM is skipped; queued
+ * and DMA-pending samples are fetched again after the resource handoff. */
+static int rv_write_music_pcm(struct rv_mp3_decoder *decoder,
+                              const uint8_t *pcm, size_t bytes)
+{
+  size_t skip = decoder->skip_pcm < bytes ? decoder->skip_pcm : bytes;
+  decoder->skip_pcm -= skip;
+  if (rv_player_stop_requested(decoder->player)) return -ECANCELED;
+  if (skip == bytes) return 0;
+  return robot_audio_playback_write(pcm + skip, bytes - skip);
+}
+
 static int rv_write_pcm(struct rv_mp3_decoder *decoder, const int16_t *samples,
                         int sample_count, int channels, int sample_rate)
 {
@@ -276,7 +263,7 @@ static int rv_write_pcm(struct rv_mp3_decoder *decoder, const int16_t *samples,
           if (output_count == (int)(sizeof(decoder->pcm) /
                                     sizeof(decoder->pcm[0])))
             {
-              int ret = robot_audio_playback_write(
+              int ret = rv_write_music_pcm(decoder,
                   (const uint8_t *)decoder->pcm, sizeof(decoder->pcm));
               if (ret < 0)
                 {
@@ -294,7 +281,7 @@ static int rv_write_pcm(struct rv_mp3_decoder *decoder, const int16_t *samples,
 
   if (output_count > 0)
     {
-      int ret = robot_audio_playback_write((const uint8_t *)decoder->pcm,
+      int ret = rv_write_music_pcm(decoder, (const uint8_t *)decoder->pcm,
                                            (size_t)output_count * sizeof(int16_t));
       if (ret < 0)
         {
@@ -523,7 +510,8 @@ static void *rv_mp3_decode_worker(void *arg)
       while (decoder->queue_count == 0 && !decoder->queue_stop)
         pthread_cond_wait(&decoder->queue_data, &decoder->queue_lock);
 
-      if (decoder->queue_count == 0 && decoder->queue_stop)
+      if (rv_player_stop_requested(decoder->player) ||
+          (decoder->queue_count == 0 && decoder->queue_stop))
         {
           pthread_mutex_unlock(&decoder->queue_lock);
           break;
@@ -624,7 +612,7 @@ static int rv_mp3_sink(char **buffer, int offset, int datend, int *buflen,
                  "[%s] HTTP Range resume rejected status=%ld offset=%zu\n",
                  RV_MEDIA_TAG,
                  decoder->http_context != NULL ?
-                   decoder->http_context->http_status : 0,
+                   (long)decoder->http_context->http_status : 0L,
                  decoder->stream_offset);
           return -EPROTO;
         }
@@ -815,6 +803,7 @@ static void *rv_url_worker(void *arg)
     }
 
   decoder->player = player;
+  decoder->skip_pcm = player->played_bytes;
   if (pthread_mutex_init(&decoder->queue_lock, NULL) != 0)
     {
       result = -ENOMEM;
@@ -852,9 +841,8 @@ static void *rv_url_worker(void *arg)
     decoder->decode_worker_started = true;
   }
 
-  /* Music responses may be throttled or briefly stalled. A 30-second
-   * receive deadline made WebClient abort an otherwise valid stream with
-   * -EAGAIN before enough PCM reached the startup watermark. */
+  /* Short receive slices keep this owner joinable. Transient stalls use
+   * the existing bounded byte-range retry, without a WLAN callback wait. */
   syslog(LOG_INFO, "[%s] HTTP MP3 begin url=%s\n", RV_MEDIA_TAG,
          player->url);
   syslog(LOG_INFO,
@@ -910,12 +898,7 @@ static void *rv_url_worker(void *arg)
           rv_player_stop_requested(player) ||
           decoder->resume_rejected ||
           (decoder->sink_error < 0) ||
-          !(webclient_result == -EBUSY ||
-            webclient_result == -ENOTCONN ||
-            webclient_result == -ECONNRESET ||
-            webclient_result == -EPIPE ||
-            webclient_result == -ETIMEDOUT ||
-            webclient_result == -EAGAIN))
+          !rv_http_retryable(webclient_result))
         {
           break;
         }
@@ -934,12 +917,18 @@ static void *rv_url_worker(void *arg)
           no_progress_retries++;
         }
 
+      /* Recovery belongs to the existing Wi-Fi owner. This producer must
+       * remain joinable during task preemption; do not perform a blocking
+       * reconnect or reset the radio used by the Feishu receiver here. */
+      if (rv_player_stop_requested(player)) break;
       resume_attempts++;
       syslog(LOG_WARNING,
              "[%s] HTTP MP3 interrupted rc=%d; resume=%u offset=%zu\n",
              RV_MEDIA_TAG, webclient_result, resume_attempts,
              decoder->stream_offset);
-      usleep(RV_HTTP_RESUME_DELAY_MS * 1000);
+      for (unsigned int waited = 0; waited < RV_HTTP_RESUME_DELAY_MS &&
+           !rv_player_stop_requested(player); waited += 20)
+        usleep(20 * 1000);
     }
 
   request_elapsed_ms = rv_media_now_ms() - request_start_ms;
@@ -978,6 +967,8 @@ decoder_cleanup:
           if (decoder->queue_error < 0 && result == 0)
             result = decoder->queue_error;
         }
+      if (result == 0 && decoder->skip_pcm && !rv_player_stop_requested(player))
+        result = -ENODATA; /* Track ended before the saved audible checkpoint. */
       http_bytes = decoder->http_bytes;
       pcm_bytes = decoder->pcm_bytes;
       frame_count = decoder->frame_count;
@@ -1011,16 +1002,22 @@ decoder_cleanup:
 
   pthread_mutex_lock(&player->lock);
   bool playback_open = player->playback_open;
-  player->playback_open = false;
   pthread_mutex_unlock(&player->lock);
-  if (playback_open)
+  if (playback_open && !stopped)
+    finish_result = robot_audio_playback_finish();
+  /* Leave ownership visible while finish drains, so pause can cancel it.
+   * Serialize the final free with cancel using the existing player lock. */
+  pthread_mutex_lock(&player->lock);
+  if (player->playback_open)
     {
-      if (!stopped)
-        {
-          finish_result = robot_audio_playback_finish();
-        }
       robot_audio_playback_close();
+      player->playback_open = false;
     }
+  stopped = player->stop_requested;
+  pthread_mutex_unlock(&player->lock);
+
+  if (robot_task_release_music_transport != NULL)
+    robot_task_release_music_transport();
 
   if (!stopped && result == 0 && finish_result < 0)
     {
@@ -1028,7 +1025,7 @@ decoder_cleanup:
     }
 
   pthread_mutex_lock(&player->lock);
-  player->worker_done = true;
+  if (!stopped) player->started = false;
   pthread_mutex_unlock(&player->lock);
 
   if (stopped)
@@ -1145,7 +1142,8 @@ int robot_legacy_media_prepare(void *handle, const char *url, const char *option
       return -EBUSY;
     }
 
-  player->options = options;
+  (void)options;
+  player->played_bytes = 0;
   if (url)
     {
       ret = rv_normalize_url(url, player->url, sizeof(player->url));
@@ -1179,129 +1177,161 @@ int robot_legacy_media_prepare(void *handle, const char *url, const char *option
   return ret;
 }
 
+/* All start/stop/pause/close transitions share the existing active lock.
+ * The URL worker never takes it, so joining it here cannot invert locks. */
+static int rv_media_start_locked(struct rv_media_player *player)
+{
+  pthread_attr_t attr;
+  int ret;
+  pthread_mutex_lock(&player->lock);
+  unsigned char saved_pause = player->paused;
+  bool valid = player->prepared && (!player->started || player->paused);
+  bool notify_started = player->paused != RV_MEDIA_AUTO_PAUSED;
+  pthread_mutex_unlock(&player->lock);
+  if (!valid) return -EINVAL;
+  if (g_rv_active_player && g_rv_active_player != player &&
+      (robot_legacy_media_is_running(g_rv_active_player) ||
+       robot_legacy_media_is_paused(g_rv_active_player))) return -EBUSY;
+  if (player->worker_started)
+    {
+      (void)pthread_join(player->worker, NULL);
+      player->worker_started = false;
+    }
+  ret = robot_task_acquire_music_transport != NULL ?
+        robot_task_acquire_music_transport() : -ENOSYS;
+  if (ret == -EBUSY)
+    {
+      /* A music tool may run inside a foreground Agent task. Stage it on
+       * the same handle; its end hook/idle tick will start it after TTS. */
+      pthread_mutex_lock(&player->lock);
+      player->paused = RV_MEDIA_STAGED;
+      player->started = true;
+      pthread_mutex_unlock(&player->lock);
+      g_rv_active_player = player;
+      return 0;
+    }
+  if (ret < 0) return ret;
+  if (robot_voice_http_close_idle != NULL) robot_voice_http_close_idle();
+  if (vela_tls_pool_cleanup != NULL) vela_tls_pool_cleanup();
+  pthread_mutex_lock(&player->lock);
+  player->stop_requested = false;
+  player->paused = 0;
+  ret = robot_audio_playback_open_music();
+  if (ret < 0) goto failed;
+  player->playback_open = true;
+  player->started = true;
+  if (player->url_mode)
+    {
+      ret = pthread_attr_init(&attr);
+      if (ret != 0) { ret = -ret; goto close_audio; }
+      ret = pthread_attr_setstacksize(&attr, 12288);
+      if (ret == 0)
+        ret = pthread_create(&player->worker, &attr, rv_url_worker, player);
+      pthread_attr_destroy(&attr);
+      if (ret != 0) { ret = -ret; goto close_audio; }
+      player->worker_started = true;
+    }
+  g_rv_active_player = player;
+  pthread_mutex_unlock(&player->lock);
+  if (notify_started) rv_emit_event(player, RV_EVENT_STARTED, 0);
+  syslog(LOG_INFO, "[RV-TASK] music running checkpoint_pcm=%zu\n", player->played_bytes);
+  return 0;
+close_audio:
+  player->playback_open = false;
+  robot_audio_playback_close();
+failed:
+  player->started = saved_pause != 0;
+  player->paused = saved_pause;
+  player->stop_requested = saved_pause != 0;
+  pthread_mutex_unlock(&player->lock);
+  robot_task_release_music_transport();
+  return ret;
+}
+
 int robot_legacy_media_start(void *handle)
 {
   struct rv_media_player *player = handle;
   int ret;
+  if (!player) return -EINVAL;
+  pthread_mutex_lock(&g_rv_active_lock);
+  ret = rv_media_start_locked(player);
+  pthread_mutex_unlock(&g_rv_active_lock);
+  return ret;
+}
 
-  if (!player)
-    {
-      return -EINVAL;
-    }
-
+/* Keep allocation/lifetime stable until all music producers have returned.
+ * close() alone would free a ring underneath a blocked decode writer. */
+static int rv_media_quiesce_locked(struct rv_media_player *player,
+                                    unsigned char paused)
+{
+  uint64_t completed = 0;
   pthread_mutex_lock(&player->lock);
-  if (!player->prepared || player->started)
+  if (paused && (!player->started || !player->url_mode))
     {
       pthread_mutex_unlock(&player->lock);
-      return -EINVAL;
+      return player->started ? -ENOTSUP : 0;
     }
-  player->started = true;
-  player->stop_requested = false;
-  player->worker_done = false;
-  player->playback_open = false;
+  if (paused && player->paused)
+    {
+      if (paused == RV_MEDIA_USER_PAUSED) player->paused = RV_MEDIA_USER_PAUSED;
+      pthread_mutex_unlock(&player->lock);
+      if (paused == RV_MEDIA_USER_PAUSED) rv_emit_event(player, RV_EVENT_PAUSED, 0);
+      return 0;
+    }
+  player->stop_requested = true;
+  player->paused = paused;
+  if (player->playback_open)
+    completed = robot_audio_playback_cancel();
+  if (paused)
+    {
+      if (completed > SIZE_MAX - player->played_bytes)
+        {
+          player->paused = RV_MEDIA_USER_PAUSED;
+          paused = RV_MEDIA_USER_PAUSED; /* Do not auto-resume an unrepresentable checkpoint. */
+        }
+      else player->played_bytes += (size_t)completed;
+    }
   pthread_mutex_unlock(&player->lock);
-
-  ret = robot_audio_playback_open_music();
-  if (ret < 0)
+  if (player->worker_started)
+    {
+      (void)pthread_join(player->worker, NULL);
+      player->worker_started = false;
+    }
+  if (player->playback_open)
+    {
+      player->playback_open = false;
+      robot_audio_playback_close();
+      if (robot_task_release_music_transport)
+        robot_task_release_music_transport();
+    }
+  if (!paused)
     {
       pthread_mutex_lock(&player->lock);
       player->started = false;
+      player->played_bytes = 0;
       pthread_mutex_unlock(&player->lock);
-      return ret;
+      rv_emit_event(player, RV_EVENT_STOPPED, 0);
     }
-
-  pthread_mutex_lock(&player->lock);
-  player->playback_open = true;
-  if (player->url_mode)
-    {
-      pthread_attr_t attr;
-      if (pthread_attr_init(&attr) != 0)
-        {
-          player->playback_open = false;
-          pthread_mutex_unlock(&player->lock);
-          robot_audio_playback_close();
-          return -EAGAIN;
-        }
-
-      (void)pthread_attr_setstacksize(&attr, 12288);
-      ret = pthread_create(&player->worker, &attr, rv_url_worker, player);
-      pthread_attr_destroy(&attr);
-      if (ret != 0)
-        {
-          player->playback_open = false;
-          pthread_mutex_unlock(&player->lock);
-          robot_audio_playback_close();
-          return -ret;
-        }
-      player->worker_started = true;
-    }
-  pthread_mutex_unlock(&player->lock);
-
-  pthread_mutex_lock(&g_rv_active_lock);
-  g_rv_active_player = player;
-  pthread_mutex_unlock(&g_rv_active_lock);
-
-  syslog(LOG_INFO, "[%s] started mode=%s\n", RV_MEDIA_TAG,
-         player->url_mode ? "url" : "pcm");
-  rv_emit_event(player, RV_EVENT_STARTED, 0);
+  if (paused == RV_MEDIA_USER_PAUSED) rv_emit_event(player, RV_EVENT_PAUSED, 0);
+  if (paused)
+    syslog(LOG_INFO, "[RV-TASK] music yielded checkpoint_pcm=%zu user_pause=%d\n",
+           player->played_bytes, paused == RV_MEDIA_USER_PAUSED);
   return 0;
 }
 
 static int rv_media_player_stop_internal(struct rv_media_player *player)
 {
-  pthread_t worker;
-  bool join_worker;
-  bool playback_open;
-
-  if (!player)
-    {
-      return -EINVAL;
-    }
-
-  pthread_mutex_lock(&player->lock);
-  player->stop_requested = true;
-  worker = player->worker;
-  join_worker = player->worker_started;
-  player->worker_started = false;
-  pthread_mutex_unlock(&player->lock);
-
-  if (join_worker && !pthread_equal(pthread_self(), worker))
-    {
-      (void)pthread_join(worker, NULL);
-    }
-
-  pthread_mutex_lock(&player->lock);
-  playback_open = player->playback_open;
-  player->playback_open = false;
-  player->started = false;
-  pthread_mutex_unlock(&player->lock);
-
-  if (playback_open)
-    {
-      /* User stop should be immediate: do not drain queued music first. */
-      robot_audio_playback_close();
-    }
-
-  rv_emit_event(player, RV_EVENT_STOPPED, 0);
-  return 0;
+  return player ? rv_media_quiesce_locked(player, 0) : -EINVAL;
 }
 
 int robot_legacy_media_stop(void *handle)
 {
   struct rv_media_player *player = handle;
   int ret;
-
-  if (!player)
-    {
-      return -EINVAL;
-    }
-
+  if (!player) return -EINVAL;
   pthread_mutex_lock(&g_rv_active_lock);
-  if (g_rv_active_player == player)
-    {
-      g_rv_active_player = NULL;
-    }
   ret = rv_media_player_stop_internal(player);
+  if (g_rv_active_player == player) g_rv_active_player = NULL;
   pthread_mutex_unlock(&g_rv_active_lock);
   return ret;
 }
@@ -1412,10 +1442,75 @@ int robot_legacy_media_stop_active(void)
   return ret;
 }
 
+int robot_legacy_media_suspend(void *handle)
+{
+  struct rv_media_player *player = handle;
+  int ret;
+  if (!player) return -EINVAL;
+  pthread_mutex_lock(&g_rv_active_lock);
+  ret = rv_media_quiesce_locked(player, RV_MEDIA_AUTO_PAUSED);
+  pthread_mutex_unlock(&g_rv_active_lock);
+  return ret;
+}
+
 int robot_legacy_media_pause(void *handle)
 {
-  (void)handle;
-  return -ENOTSUP;
+  struct rv_media_player *player = handle;
+  int ret;
+  if (!player) return -EINVAL;
+  pthread_mutex_lock(&g_rv_active_lock);
+  ret = rv_media_quiesce_locked(player, RV_MEDIA_USER_PAUSED);
+  pthread_mutex_unlock(&g_rv_active_lock);
+  return ret;
+}
+
+int robot_legacy_media_resume_active(void)
+{
+  int ret = 0;
+  pthread_mutex_lock(&g_rv_active_lock);
+  if (g_rv_active_player)
+    {
+      pthread_mutex_lock(&g_rv_active_player->lock);
+      bool resume = g_rv_active_player->started &&
+        (g_rv_active_player->paused == RV_MEDIA_AUTO_PAUSED ||
+         g_rv_active_player->paused == RV_MEDIA_STAGED);
+      pthread_mutex_unlock(&g_rv_active_player->lock);
+      if (resume) ret = rv_media_start_locked(g_rv_active_player);
+    }
+  pthread_mutex_unlock(&g_rv_active_lock);
+  return ret;
+}
+
+bool robot_legacy_media_start_pending(void *handle)
+{
+  struct rv_media_player *player = handle;
+  if (!player) return false;
+  pthread_mutex_lock(&player->lock);
+  bool pending = player->started && player->paused == RV_MEDIA_STAGED;
+  pthread_mutex_unlock(&player->lock);
+  return pending;
+}
+
+bool robot_legacy_media_is_running(void *handle)
+{
+  struct rv_media_player *player = handle;
+  bool running;
+  if (!player) return false;
+  pthread_mutex_lock(&player->lock);
+  running = player->started && !player->paused && !player->stop_requested;
+  pthread_mutex_unlock(&player->lock);
+  return running;
+}
+
+bool robot_legacy_media_is_paused(void *handle)
+{
+  struct rv_media_player *player = handle;
+  bool paused;
+  if (!player) return false;
+  pthread_mutex_lock(&player->lock);
+  paused = player->started && player->paused != 0;
+  pthread_mutex_unlock(&player->lock);
+  return paused;
 }
 
 int robot_legacy_media_seek(void *handle, unsigned int position)
@@ -1427,12 +1522,16 @@ int robot_legacy_media_seek(void *handle, unsigned int position)
 
 int robot_legacy_media_get_position(void *handle, unsigned int *position)
 {
-  (void)handle;
-  if (position)
-    {
-      *position = 0;
-    }
-  return -ENOTSUP;
+  struct rv_media_player *player = handle;
+  uint64_t completed = 0, pending = 0;
+  if (!player || !position) return -EINVAL;
+  pthread_mutex_lock(&g_rv_active_lock);
+  if (player->playback_open)
+    (void)robot_audio_playback_progress(&completed, &pending);
+  *position = (unsigned int)((player->played_bytes + completed) * 1000ULL /
+                             (RV_OUTPUT_RATE * sizeof(int16_t)));
+  pthread_mutex_unlock(&g_rv_active_lock);
+  return 0;
 }
 
 int robot_legacy_media_get_duration(void *handle, unsigned int *duration)

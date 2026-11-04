@@ -463,77 +463,63 @@ static int download_feishu_image(const char* message_id, const char* image_key)
     return 0;
 }
 
-static bool handle_image_message(cJSON* msg, const char* chat_id, cJSON* content_j)
+static bool group_mentions_bot(cJSON *msg);
+
+/* Queue compact references, never download images on the WS receive task. */
+static char *image_reference(cJSON *msg, const char *image_key, const char *text)
 {
-    cJSON* msg_id_j = cJSON_GetObjectItem(msg, "message_id");
-    if (!cJSON_IsString(msg_id_j) || !msg_id_j->valuestring[0]) {
-        syslog(LOG_WARNING, "[%s] image msg but no message_id\n", TAG);
-        return true;
+    const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(msg, "message_id"));
+    if (!id || !id[0] || !image_key || !image_key[0]) return NULL;
+    cJSON *ref = cJSON_CreateObject();
+    cJSON_AddStringToObject(ref, "message_id", id);
+    cJSON_AddStringToObject(ref, "image_key", image_key);
+    cJSON_AddStringToObject(ref, "text", text ? text : "");
+    char *result = cJSON_PrintUnformatted(ref);
+    cJSON_Delete(ref);
+    return result;
+}
+
+int feishu_prepare_agent_image(agent_msg_t *msg)
+{
+    cJSON *ref = cJSON_Parse(msg->content);
+    const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(ref, "message_id"));
+    const char *key = cJSON_GetStringValue(cJSON_GetObjectItem(ref, "image_key"));
+    const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(ref, "text"));
+    if (!id || !key || download_feishu_image(id, key) != 0) {
+        cJSON_Delete(ref);
+        return ERROR;
     }
-
-    const char* image_key = NULL;
-    cJSON* cj = NULL;
-
-    if (cJSON_IsString(content_j) && content_j->valuestring[0]) {
-        cj = cJSON_Parse(content_j->valuestring);
-        if (cj) {
-            cJSON* ik = cJSON_GetObjectItem(cj, "image_key");
-            if (cJSON_IsString(ik)) {
-                image_key = ik->valuestring;
-            }
-        }
+    size_t cap = strlen(AGENT_CAPTURE_PATH) + (text ? strlen(text) : 0) + 128;
+    char *prompt = malloc(cap);
+    if (!prompt) {
+        cJSON_Delete(ref);
+        return ERROR;
     }
+    snprintf(prompt, cap, "[User sent an image at %s] %s",
+             AGENT_CAPTURE_PATH, text && text[0] ? text : "Please analyze it using analyze_image.");
+    cJSON_Delete(ref);
+    free(msg->content);
+    msg->content = prompt;
+    msg->flags &= ~AGENT_MSG_FLAG_FEISHU_IMAGE;
+    return OK;
+}
 
-    if (!image_key || !image_key[0]) {
-        cJSON* ik2 = cJSON_GetObjectItem(msg, "image_key");
-        if (cJSON_IsString(ik2)) {
-            image_key = ik2->valuestring;
-        }
-    }
-
-    if (!image_key || !image_key[0]) {
-        syslog(LOG_WARNING, "[%s] image msg but no image_key\n", TAG);
-        cJSON_Delete(cj);
-        return true;
-    }
-
-    if (download_feishu_image(msg_id_j->valuestring, image_key) != 0) {
-        cJSON_Delete(cj);
-        return true;
-    }
-
-    cJSON* ct_j = cJSON_GetObjectItem(msg, "chat_type");
-    const char* ct = cJSON_IsString(ct_j) ? ct_j->valuestring : "p2p";
-
-    if (strcmp(ct, "group") == 0) {
-        cJSON* mentions = cJSON_GetObjectItem(msg, "mentions");
-        if (!cJSON_IsArray(mentions) || cJSON_GetArraySize(mentions) == 0) {
-            syslog(LOG_DEBUG, "[%s] Group image without @mention, skipping\n", TAG);
-            cJSON_Delete(cj);
-            return true;
-        }
-    }
-
-    char prompt[128];
-    snprintf(prompt, sizeof(prompt),
-        "User sent an image. Analyze it: %s", AGENT_CAPTURE_PATH);
-
+static bool handle_image_message(cJSON *msg, const char *chat_id, cJSON *content_j,
+                                 bool defer_music)
+{
+    if (!group_mentions_bot(msg)) return true;
+    cJSON *cj = cJSON_IsString(content_j) ? cJSON_Parse(content_j->valuestring) : NULL;
+    const char *key = cJSON_GetStringValue(cJSON_GetObjectItem(cj, "image_key"));
+    if (!key || !key[0]) key = cJSON_GetStringValue(cJSON_GetObjectItem(msg, "image_key"));
     agent_msg_t m = { 0 };
     strncpy(m.channel, AGENT_CHAN_FEISHU, sizeof(m.channel) - 1);
     strncpy(m.chat_id, chat_id, sizeof(m.chat_id) - 1);
-    m.content = strdup(prompt);
-    if (!m.content) {
-        syslog(LOG_ERR, "[%s] OOM strdup image prompt\n", TAG);
-        cJSON_Delete(cj);
-        return true;
-    }
-    m.image_b64 = NULL;
-    if (message_bus_push_inbound(&m) != OK) {
-        syslog(LOG_WARNING, "[%s] inbound queue full; dropping Feishu image chat=%s\n",
-            TAG, chat_id);
-        free(m.content);
-    } else {
-        syslog(LOG_INFO, "[%s] Image msg from [%.24s] pushed to bus\n", TAG, chat_id);
+    m.content = image_reference(msg, key, NULL);
+    m.flags = AGENT_MSG_FLAG_FEISHU_IMAGE |
+              (defer_music ? AGENT_MSG_FLAG_DEFER_MUSIC : 0);
+    if (!m.content || message_bus_push_inbound(&m) != OK) {
+        message_bus_msg_free(&m);
+        syslog(LOG_WARNING, "[%s] Feishu image not queued\n", TAG);
     }
     cJSON_Delete(cj);
     return true;
@@ -597,44 +583,10 @@ static char* extract_post_text(cJSON* cj, char* post_img_key, size_t img_key_cap
     }
 
     if (buf[0]) {
-        char* result = strdup(buf);
-        free(buf);
-        return result;
+        return buf;
     }
     free(buf);
     return NULL;
-}
-
-static void download_post_image(const char* post_image_key, cJSON* msg, char** text_ptr)
-{
-    cJSON* msg_id_j = cJSON_GetObjectItem(msg, "message_id");
-    if (!cJSON_IsString(msg_id_j) || !msg_id_j->valuestring[0]) {
-        return;
-    }
-
-    if (download_feishu_image(msg_id_j->valuestring, post_image_key) != 0) {
-        return;
-    }
-
-    char* old_text = *text_ptr;
-    size_t hint_len = 128 + (old_text ? strlen(old_text) : 0);
-    char* new_text = malloc(hint_len);
-    if (!new_text) {
-        return;
-    }
-
-    if (old_text && old_text[0] && old_text[0] != '\n') {
-        snprintf(new_text, hint_len, "[User sent an image at %s] %s",
-            AGENT_CAPTURE_PATH, old_text);
-    } else {
-        snprintf(new_text, hint_len,
-            "User sent an image. Please analyze it using the "
-            "analyze_image tool. Path: %s",
-            AGENT_CAPTURE_PATH);
-    }
-
-    free(old_text);
-    *text_ptr = new_text;
 }
 
 /* ── Text processing helpers ───────────────────────────────────── */
@@ -806,10 +758,26 @@ static void apply_single_mention(cJSON* m_item, char** text_ptr,
     snprintf(repl, sizeof(repl), "@%s", display);
     replace_placeholder(text_ptr, key, repl);
 
-    if (mention_oid && mention_oid[0]) {
-        *map_off += snprintf(mention_map + *map_off, map_cap - *map_off,
+    if (mention_oid && mention_oid[0] && *map_off < map_cap) {
+        size_t remaining = map_cap - *map_off;
+        int n = snprintf(mention_map + *map_off, remaining,
             "%s%s=%s", *map_off > 0 ? ", " : "", display, mention_oid);
+        if (n > 0) *map_off += (size_t)n < remaining ? (size_t)n : remaining - 1;
     }
+}
+
+static bool group_mentions_bot(cJSON *msg)
+{
+    const char *ct = cJSON_GetStringValue(cJSON_GetObjectItem(msg, "chat_type"));
+    if (!ct || strcmp(ct, "group")) return true;
+    cJSON *item;
+    cJSON_ArrayForEach(item, cJSON_GetObjectItem(msg, "mentions")) {
+        const char *key = cJSON_GetStringValue(cJSON_GetObjectItem(item, "key"));
+        const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(
+            cJSON_GetObjectItem(item, "id"), "open_id"));
+        if (key && is_bot_self_mention(key, id)) return true;
+    }
+    return false;
 }
 
 static bool process_group_mentions(cJSON* msg, char** text_ptr)
@@ -823,8 +791,10 @@ static bool process_group_mentions(cJSON* msg, char** text_ptr)
     }
 
     cJSON* mentions = cJSON_GetObjectItem(msg, "mentions");
-    if (!cJSON_IsArray(mentions) || cJSON_GetArraySize(mentions) == 0) {
-        syslog(LOG_DEBUG, "[%s] Group msg without @mention, skipping\n", TAG);
+    if (!group_mentions_bot(msg)) {
+        syslog(LOG_DEBUG, "[%s] Group msg without bot @mention, skipping\n", TAG);
+        free(*text_ptr);
+        *text_ptr = NULL;
         return true;
     }
 
@@ -983,7 +953,7 @@ void feishu_process_binary_frame(const uint8_t* data, int len, int32_t svc_id)
     }
 
     if (is_image) {
-        handle_image_message(msg, chat_id_j->valuestring, content_j);
+        handle_image_message(msg, chat_id_j->valuestring, content_j, is_bot_sender);
         goto cleanup;
     }
 
@@ -1007,8 +977,10 @@ void feishu_process_binary_frame(const uint8_t* data, int len, int32_t svc_id)
         }
         cJSON_Delete(cj);
 
-        if (post_image_key[0] && text) {
-            download_post_image(post_image_key, msg, &text);
+        /* Image-only posts still enter the same scheduler path. */
+        if (post_image_key[0] && (!text || !text[0])) {
+            free(text);
+            text = strdup("请分析图片");
         }
 
         if (!text || !text[0]) {
@@ -1048,7 +1020,11 @@ void feishu_process_binary_frame(const uint8_t* data, int len, int32_t svc_id)
             goto cleanup;
         }
 
-        if (!post_image_key[0] && content_dedup_check(chat_id_j->valuestring, text)) {
+        /* Human commands may intentionally repeat after pause/resume. Their
+         * event_id/message_id already deduplicate transport retries. Content
+         * throttling remains only for bot-to-bot loop protection. */
+        if (is_bot_sender && !post_image_key[0] &&
+            content_dedup_check(chat_id_j->valuestring, text)) {
             free(text);
             text = NULL;
             goto cleanup;
@@ -1075,18 +1051,25 @@ void feishu_process_binary_frame(const uint8_t* data, int len, int32_t svc_id)
         strncpy(m.channel, AGENT_CHAN_FEISHU, sizeof(m.channel) - 1);
         strncpy(m.chat_id, chat_id_j->valuestring, sizeof(m.chat_id) - 1);
         m.content = text;
+        if (is_bot_sender) m.flags |= AGENT_MSG_FLAG_DEFER_MUSIC;
         if (message_disables_tts(text)) {
             m.flags |= AGENT_MSG_FLAG_NO_TTS;
             syslog(LOG_INFO, "[%s] TTS disabled by user directive\n", TAG);
+        }
+        if (post_image_key[0]) {
+            m.content = image_reference(msg, post_image_key, text);
+            free(text);
+            text = NULL;
+            if (!m.content) goto cleanup;
+            m.flags |= AGENT_MSG_FLAG_FEISHU_IMAGE;
         }
         if (message_bus_push_inbound(&m) != OK) {
             syslog(LOG_WARNING,
                 "[%s] inbound queue full; dropping Feishu message chat=%s\n",
                 TAG, chat_id_j->valuestring);
             free(m.content);
-        } else {
-            text = NULL; /* ownership transferred */
         }
+        text = NULL; /* freed on failure, owned by queue on success */
     }
 
 cleanup:

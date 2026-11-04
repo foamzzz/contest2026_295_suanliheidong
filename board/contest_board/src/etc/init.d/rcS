@@ -8,8 +8,8 @@
 
 set +e
 
-# Run the Agent in the foreground so its command reader is the only reader
-# of the console while the ordered startup sequence is running.
+/* Run the Agent in the foreground so its command reader is the only reader
+ * of the console while the ordered startup sequence is running. */
 ai_agent
 
 /*

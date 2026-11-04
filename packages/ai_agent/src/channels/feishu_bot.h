@@ -17,6 +17,7 @@
 #pragma once
 
 #include "agent_compat.h"
+#include "core/message_bus.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,6 +25,8 @@ extern "C" {
 
 #ifdef CONFIG_AI_AGENT_FEISHU
 
+/* Called by Agent only, after music has yielded network/audio resources. */
+int feishu_prepare_agent_image(agent_msg_t *msg);
 int feishu_bot_init(void);
 int feishu_bot_start(void);
 int feishu_send_message(const char *chat_id, const char *text);

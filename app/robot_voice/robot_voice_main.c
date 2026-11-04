@@ -25,6 +25,7 @@
 #include "robot_voice_capture.h"
 #include "robot_audio_playback.h"
 #include "robot_music_player.h"
+#include "robot_task.h"
 #include "robot_music_media.h"
 #include "robot_expression.h"
 #include "robot_motion.h"
@@ -122,11 +123,6 @@ extern bool robot_music_media_owns_reply(unsigned long) __attribute__((weak));
 extern bool robot_music_media_is_active(void) __attribute__((weak));
 int voice_channel_speak(const char *text);
 
-static bool contest_voice_music_active(void)
-{
-  return robot_music_media_is_active && robot_music_media_is_active();
-}
-
 /*
  * Demo latency policy:
  *   1 = deterministic single-action voice commands execute locally.
@@ -208,17 +204,7 @@ static void robot_voice_cli_outbound_tap(const agent_msg_t *msg,
        * the short working-status messages above.  TTS is queued on a detached
        * worker so the message-bus outbound tap stays non-blocking.
        */
-      /* A music_play reply is informational. Keep the song's I2S ownership
-       * and display its confirmation as text. */
-      if (robot_music_media_is_active && robot_music_media_is_active())
-        {
-          RV_EVENT("[RV-MUSIC] CLI confirmation remains text; keep music I2S owner\n");
-          tts_ret = 0;
-        }
-      else
-        {
-          tts_ret = robot_voice_cli_tts_submit(msg->content);
-        }
+      tts_ret = robot_voice_cli_tts_submit(msg->content);
       if (tts_ret < 0)
         {
           printf("[CLI-TTS] queue failed rc=%d\n", tts_ret);
@@ -858,6 +844,11 @@ static int contest_voice_route_text(const char *text)
 
 /* Continuous monitor is compiled in this translation unit. Acoustic DSP and
  * TFLM are separate C/C++ units with explicit Make/CMake build entries. */
+#include "robot_task.h"
+extern int robot_music_media_suspend(void) __attribute__((weak));
+extern bool robot_music_media_has_task(void) __attribute__((weak));
+extern bool robot_music_media_owns_reply(unsigned long) __attribute__((weak));
+static void rv_return_to_wake_locked(void);
 #include "robot_voice_afe.h"
 #define RV_MS_BYTES(ms) ((size_t)ROBOT_VOICE_CAPTURE_RATE * 2 * (ms) / 1000)
 #define RV_RESULT_COUNT (ROBOT_VOICE_ASR_WORKERS + ROBOT_VOICE_ASR_QUEUE)
@@ -1449,7 +1440,9 @@ static void rv_reply_done_for_run(bool agent_reply, unsigned long run_id)
         {
           g_monitor.phase = RV_MON_LISTEN;
         }
-      rv_listening_expression_locked();
+      if (agent_reply && robot_music_media_has_task && robot_music_media_has_task())
+        rv_return_to_wake_locked();
+      else rv_listening_expression_locked();
       pthread_cond_broadcast(&g_monitor.changed);
     }
   pthread_mutex_unlock(&g_monitor.lock);
@@ -1753,20 +1746,6 @@ static int rv_monitor_pcm(const struct robot_voice_afe_frame_s *frame, void *arg
   unsigned int votes = 0;
   bool voiced = frame->voiced;
 
-  /* A song owns the speaker and must not be interrupted by ambient audio,
-   * stale ASR jobs, or a second voice turn. Keep capture alive so the worker
-   * can resume immediately after natural EOF, but discard frames while the
-   * native Media handle is active. */
-  if (contest_voice_music_active())
-    {
-      pthread_mutex_lock(&g_monitor.lock);
-      rv_segment_reset(seg);
-      seg->pre_used = 0;
-      rv_wake_buffer_reset_locked(seg);
-      pthread_mutex_unlock(&g_monitor.lock);
-      return 0;
-    }
-
   pthread_mutex_lock(&g_monitor.lock);
   g_monitor.frames++;
   if (!g_monitor.capture_ready) {
@@ -1993,6 +1972,11 @@ static bool rv_accept_acoustic_wake(const struct robot_wakeword_result_s *result
       accepted = true;
     }
   pthread_mutex_unlock(&g_monitor.lock);
+  if (accepted && robot_music_media_suspend)
+    {
+      int pause_ret = robot_music_media_suspend();
+      if (pause_ret < 0) RV_EVENT("[RV-TASK] wake music handoff failed rc=%d\n", pause_ret);
+    }
   return accepted;
 }
 
@@ -2091,7 +2075,7 @@ static int rv_asr_check_cancel(const char *text, void *arg)
   int ret;
   (void)text;
   pthread_mutex_lock(&g_monitor.lock);
-  ret = contest_voice_music_active() || g_monitor.stop || g_voice_stop_requested ||
+  ret = g_monitor.stop || g_voice_stop_requested ||
         job->epoch != g_monitor.epoch ?
         -ECANCELED : 0;
   pthread_mutex_unlock(&g_monitor.lock);
@@ -2328,14 +2312,6 @@ static void rv_process_result(struct rv_monitor_job_s *job)
   unsigned long exit_run = 0;
 
   pthread_mutex_lock(&g_monitor.lock);
-  if (contest_voice_music_active())
-    {
-      if (job->final)
-        {
-          g_monitor.consumed_final = job->final_seq;
-        }
-      goto done;
-    }
   if (job->epoch != g_monitor.epoch || g_voice_stop_requested ||
       g_monitor.reply_locked)
     {
@@ -2450,11 +2426,6 @@ static void rv_dispatch_pending(void)
   bool notify = true;
   unsigned long run_id;
   unsigned long long now = robot_voice_now_ms();
-
-  if (contest_voice_music_active())
-    {
-      return;
-    }
 
   pthread_mutex_lock(&g_monitor.lock);
   if (g_voice_stop_requested || g_monitor.phase != RV_MON_LISTEN ||
@@ -2782,6 +2753,7 @@ static void *voice_monitor_worker(void *arg)
           rv_process_result(result);
         }
       rv_dispatch_pending();
+      if (robot_task_resume_if_idle) robot_task_resume_if_idle();
     }
 
 cleanup:
@@ -3122,6 +3094,11 @@ int voice_channel_stop(void)
   if (!g_voice_thread_valid)
     {
       pthread_mutex_unlock(&g_voice_lock);
+      /* A previous voice session may have left idle Agent/TLS sockets behind.
+       * Retire them even when the monitor is already stopped so a later
+       * Feishu/CLI music search starts with a fresh transport. */
+      robot_voice_http_close_idle();
+      vela_tls_pool_cleanup();
       return 0;
     }
   g_voice_explicit_stop = true;
@@ -3166,6 +3143,8 @@ int voice_channel_stop(void)
       g_voice_oneshot = 0;
     }
   pthread_mutex_unlock(&g_voice_lock);
+  robot_voice_http_close_idle();
+  vela_tls_pool_cleanup();
   RV_VERBOSE("[contest_voice] voice_channel_stop state=%s\n",
          contest_voice_state_name(g_voice_state));
   return 0;
@@ -4599,7 +4578,7 @@ stop_workers:
   return ret;
 }
 
-static int voice_channel_speak_source(const char *text, bool agent_reply,
+static int voice_channel_speak_source_owned(const char *text, bool agent_reply,
                                       unsigned long run_id,
                                       struct rv_llm_speech_s *source)
 {
@@ -4612,15 +4591,6 @@ static int voice_channel_speak_source(const char *text, bool agent_reply,
     if (agent_reply) rv_reply_done_for_run(true,run_id);
     return 0; /* Never open a second direct I2S owner for music acknowledgement. */
   }
-  if (contest_voice_music_active())
-    {
-      RV_EVENT("[RV-MUSIC] suppress voice output while native Media owns I2S\n");
-      if (agent_reply)
-        {
-          rv_reply_done_for_run(true, run_id);
-        }
-      return 0;
-    }
   if (!source && (!text || text[0] == '\0'))
     {
       if (agent_reply)
@@ -4639,8 +4609,7 @@ static int voice_channel_speak_source(const char *text, bool agent_reply,
     pthread_mutex_unlock(&g_monitor.lock);
     if (!valid) ret = -ECANCELED;
     else {
-      ret = contest_voice_music_active() ? 0 :
-            rv_play_local_prompt_locked((enum robot_voice_prompt_e)prompt, run_id);
+      ret = rv_play_local_prompt_locked((enum robot_voice_prompt_e)prompt, run_id);
       if (ret != -ECANCELED) {
         rv_reply_done_for_run(agent_reply, run_id);
       }
@@ -4726,14 +4695,6 @@ static int voice_channel_speak_source(const char *text, bool agent_reply,
         }
       pthread_mutex_unlock(&g_monitor.lock);
     }
-  /* A song can start while this job waits for the speaker lock. */
-  if (contest_voice_music_active())
-    {
-      memset(key, 0, sizeof(key));
-      if (agent_reply) rv_reply_done_for_run(true, run_id);
-      pthread_mutex_unlock(&g_voice_speak_lock);
-      return 0;
-    }
   g_voice_speaking = 1;
   robot_world_state_set_tts_active(true);
   contest_voice_set_state(CONTEST_VOICE_SPEAKING);
@@ -4776,6 +4737,32 @@ static int voice_channel_speak_source(const char *text, bool agent_reply,
   return ret;
 }
 
+static int voice_channel_speak_source(const char *text, bool agent_reply,
+                                      unsigned long run_id,
+                                      struct rv_llm_speech_s *source)
+{
+  int ret;
+  pthread_mutex_lock(&g_monitor.lock);
+  bool valid = !run_id || (g_monitor.enabled && !g_voice_stop_requested &&
+                           g_monitor.run_id == run_id);
+  pthread_mutex_unlock(&g_monitor.lock);
+  if (!valid) return -ECANCELED;
+  if (run_id && robot_music_media_owns_reply && robot_music_media_owns_reply(run_id))
+    {
+      if (agent_reply) rv_reply_done_for_run(true, run_id);
+      return 0;
+    }
+  ret = robot_task_begin ? robot_task_begin() : 0;
+  if (ret < 0)
+    {
+      if (agent_reply) rv_reply_done_for_run(true, run_id);
+      return ret;
+    }
+  ret = voice_channel_speak_source_owned(text, agent_reply, run_id, source);
+  if (robot_task_end) robot_task_end();
+  return ret;
+}
+
 static void *rv_llm_speech_worker(void *arg)
 {
   struct rv_llm_speech_s *s = arg;
@@ -4805,7 +4792,34 @@ static void *rv_llm_speech_worker(void *arg)
   pthread_mutex_lock(&g_voice_lock);
   g_tts_jobs--; pthread_cond_broadcast(&g_tts_jobs_changed);
   pthread_mutex_unlock(&g_voice_lock);
+  if (robot_task_resume_if_idle) robot_task_resume_if_idle();
   return NULL;
+}
+
+bool robot_voice_task_can_resume(void)
+{
+  bool idle;
+  pthread_mutex_lock(&g_voice_lock);
+  idle = g_tts_jobs == 0 && !g_voice_speaking;
+  pthread_mutex_unlock(&g_voice_lock);
+  if (!idle) return false;
+  pthread_mutex_lock(&g_monitor.lock);
+  idle = !g_monitor.enabled ||
+    (g_monitor.phase == RV_MON_WAKE && !g_monitor.capture_active &&
+     !g_monitor.wake_handoff_pending && !g_monitor.queued && !g_monitor.in_flight &&
+     !g_monitor.pending_text[0] && !g_monitor.pending_failed &&
+     !g_monitor.stream_busy && !g_voice_reply_pending);
+  pthread_mutex_unlock(&g_monitor.lock);
+  return idle;
+}
+
+void robot_voice_music_started(void)
+{
+  pthread_mutex_lock(&g_monitor.lock);
+  if (g_monitor.enabled && g_monitor.phase != RV_MON_WAKE &&
+      !g_monitor.capture_active && !g_monitor.wake_handoff_pending)
+    rv_return_to_wake_locked();
+  pthread_mutex_unlock(&g_monitor.lock);
 }
 
 unsigned long robot_voice_music_run_id(void)
@@ -5132,17 +5146,8 @@ static void *robot_voice_cli_tts_worker(void *arg)
     }
   if (!robot_motion_is_busy())
     {
-      if (job->run_id == 0 && robot_music_media_is_active &&
-          robot_music_media_is_active())
-        {
-          RV_EVENT("[RV-MUSIC] queued CLI confirmation skipped; keep music I2S owner\n");
-          ret = 0;
-        }
-      else
-        {
-          ret = voice_channel_speak_internal(job->text, job->agent_reply,
-                                             job->run_id);
-        }
+      ret = voice_channel_speak_internal(job->text, job->agent_reply,
+                                         job->run_id);
     }
   else if (job->agent_reply)
     {
@@ -5156,6 +5161,7 @@ static void *robot_voice_cli_tts_worker(void *arg)
   g_tts_jobs--;
   pthread_cond_broadcast(&g_tts_jobs_changed);
   pthread_mutex_unlock(&g_voice_lock);
+  if (robot_task_resume_if_idle) robot_task_resume_if_idle();
   return NULL;
 }
 

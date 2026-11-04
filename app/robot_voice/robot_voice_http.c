@@ -75,6 +75,9 @@ static pthread_cond_t pool_changed = PTHREAD_COND_INITIALIZER;
 
 /* Do not force a standalone HTTP archive to pull the application entry. */
 extern unsigned long robot_voice_llm_request_token(const char *) __attribute__((weak));
+/* The two HTTP clients have separate idle pools. Release both on kernel
+ * socket-memory pressure or before an exclusive Wi-Fi recovery. */
+extern void vela_tls_pool_cleanup(void) __attribute__((weak));
 
 /* Keep the RPMSG network service awake between ASR/Flash/TTS requests.
  * Each socket retains its own balanced lease. No radio/PM global changes. */
@@ -642,6 +645,7 @@ static int tls_open_inner(struct rv_connection *slot, unsigned long long deadlin
 static pthread_mutex_t tls_setup_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tls_setup_changed = PTHREAD_COND_INITIALIZER;
 static bool tls_setup_busy;
+
 static int tls_open(struct rv_connection *slot, unsigned long long deadline,
                     int receive_bytes, rv_http_entity_cb probe, void *arg)
 {
@@ -763,7 +767,10 @@ bool robot_voice_http_network_recovery_begin(void)
   }
   pthread_mutex_unlock(&pool_lock);
   /* Other task groups retire their own stale descriptors on their next use. */
-  if (idle) robot_voice_http_close_idle();
+  if (idle) {
+    robot_voice_http_close_idle();
+    if (vela_tls_pool_cleanup != NULL) vela_tls_pool_cleanup();
+  }
   return idle;
 }
 
@@ -949,6 +956,11 @@ static int robot_voice_http_request_locked(const char *host, const char *port,
           RV_EVENT("[连接重试] kind=%s stage=%s rc=%d 尚未发送请求，重建TCP/TLS连接一次（不重启Wi-Fi）\n",
             kind, slot->tls && slot->tls->stage ? slot->tls->stage : "connect", ret);
           tls_close(slot->tls); slot->tls = NULL;
+          /* A handshake timeout can leave another idle voice connection
+           * holding stale TCP/TLS state or scarce socket resources.  Retire
+           * those idle slots before the bounded reconnect; the current slot
+           * is busy and is already closed above. */
+          robot_voice_http_close_idle();
           reused = false;
           unsigned int delay = remaining_ms(deadline, ROBOT_VOICE_HTTP_CONNECT_RETRY_DELAY_MS);
           struct timespec nap = {.tv_sec = delay / 1000,
@@ -1094,7 +1106,9 @@ out:
   /* A timed-out TLS upload with no HTTP status is also a broken transport.
    * The request may have partially filled the TCP send window, so checking
    * sent == 0 alone misses the recurring post-ASR failure seen on ESP32-S3. */
-  bool transport_failure = ret < 0 && slot->tls && slot->tls->stage &&
+  bool resource_pressure = ret == -ENOMEM || ret == -ENOBUFS ||
+    ret == -EMFILE || ret == -ENFILE || ret == -EAGAIN;
+  bool transport_failure = !resource_pressure && ret < 0 && slot->tls && slot->tls->stage &&
     ((!strcmp(slot->tls->stage, "dns") ||
       !strncmp(slot->tls->stage, "tcp-", 4)) ||
      !strcmp(slot->tls->stage, "tls-handshake") ||
@@ -1103,6 +1117,11 @@ out:
   if (ret != -ECANCELED)
     robot_voice_http_network_result(ret, transport_failure);
   release(slot, keep && ret >= 200 && !callback && strcmp(method, "GET"));
+  if (resource_pressure) {
+    RV_EVENT("[RV-NET-MEM] rc=%d; retired idle TLS pools, no Wi-Fi reset\n", ret);
+    robot_voice_http_close_idle();
+    if (vela_tls_pool_cleanup != NULL) vela_tls_pool_cleanup();
+  }
   return ret;
 }
 

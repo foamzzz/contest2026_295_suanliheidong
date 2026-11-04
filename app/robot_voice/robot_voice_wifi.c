@@ -87,8 +87,22 @@ static int robot_voice_wifi_configure_saved(void)
 }
 
 int __wrap_network_wifi_connect(const char *dev, const char *ssid, const char *pass)
-{ return network_wifi_configure(dev, ssid, pass); }
-int __wrap_network_wifi_reconnect(void) { return network_wifi_restore(); }
+{
+  int ret = network_acquire_http_transport(30000);
+  if (ret < 0) return ret;
+  ret = network_wifi_configure(dev, ssid, pass);
+  network_release_http_transport();
+  return ret;
+}
+
+int __wrap_network_wifi_reconnect(void)
+{
+  int ret = network_acquire_http_transport(30000);
+  if (ret < 0) return ret;
+  ret = network_wifi_restore();
+  network_release_http_transport();
+  return ret;
+}
 
 static int robot_voice_wifi_recover_once(void)
 {
@@ -146,12 +160,23 @@ int robot_voice_wifi_ensure_connected(uint32_t timeout_ms)
   while (rv_diag_now_ms() < deadline)
     {
       unsigned long long remaining;
+      unsigned long long before = rv_diag_now_ms();
+      uint32_t gate_wait = (uint32_t)(deadline > before ? deadline - before : 0);
+      if (gate_wait > 5000) gate_wait = 5000;
+      int gate_rc = network_acquire_http_transport(gate_wait);
+      if (gate_rc < 0)
+        {
+          last = gate_rc;
+          usleep(100 * 1000);
+          continue;
+        }
 
       if (robot_voice_http_network_recovery_begin != NULL &&
           robot_voice_http_network_recovery_end != NULL)
         {
           if (!robot_voice_http_network_recovery_begin())
             {
+              network_release_http_transport();
               usleep(100 * 1000);
               continue;
             }
@@ -166,6 +191,7 @@ int robot_voice_wifi_ensure_connected(uint32_t timeout_ms)
           robot_voice_http_network_recovery_end();
           recovery_started = false;
         }
+      network_release_http_transport();
 
       if (last == 0 && robot_voice_wifi_transport_ready())
         {
@@ -215,12 +241,23 @@ int robot_voice_wifi_reconnect_and_ensure(uint32_t timeout_ms)
   while (rv_diag_now_ms() < deadline)
     {
       unsigned long long remaining;
+      unsigned long long before = rv_diag_now_ms();
+      uint32_t gate_wait = (uint32_t)(deadline > before ? deadline - before : 0);
+      if (gate_wait > 5000) gate_wait = 5000;
+      int gate_rc = network_acquire_http_transport(gate_wait);
+      if (gate_rc < 0)
+        {
+          last = gate_rc;
+          usleep(100 * 1000);
+          continue;
+        }
 
       if (robot_voice_http_network_recovery_begin != NULL &&
           robot_voice_http_network_recovery_end != NULL)
         {
           if (!robot_voice_http_network_recovery_begin())
             {
+              network_release_http_transport();
               usleep(100 * 1000);
               continue;
             }
@@ -239,10 +276,13 @@ int robot_voice_wifi_reconnect_and_ensure(uint32_t timeout_ms)
       if (last == 0 && network_wait_connected(5000) == OK &&
           robot_voice_wifi_transport_ready())
         {
+          network_release_http_transport();
           RV_EVENT("[网络确认] forced reconnect connected attempt=%u\n",
                    attempt);
           return 0;
         }
+
+      network_release_http_transport();
 
       now = rv_diag_now_ms();
       if (now >= deadline)
@@ -277,7 +317,9 @@ void robot_voice_http_network_result(int result, bool connect_failure)
       g_wifi_recovery_backoff_ms = ROBOT_VOICE_WIFI_RECOVER_MIN_MS;
       g_wifi_next_recovery_ms = 0;
     }
-  else if (connect_failure && g_wifi_connect_failures < 3)
+  else if (connect_failure && result != -ENOMEM && result != -ENOBUFS &&
+           result != -EMFILE && result != -ENFILE && result != -EAGAIN &&
+           g_wifi_connect_failures < 3)
     {
       g_wifi_connect_failures++;
     }
@@ -316,12 +358,21 @@ void robot_voice_wifi_poll(void)
       return;
     }
 
-  /* Do not tear down sockets while another HTTP request is active. */
+  /* Reserve the same gate used by Agent, ASR, Flash and TTS before touching
+   * Wi-Fi. Checking only the contest pool misses vela_tls requests, so the
+   * old recovery path could disconnect an unrelated active HTTPS request. */
+  ret = network_acquire_http_transport(1);
+  if (ret < 0)
+    {
+      return;
+    }
+
   if (robot_voice_http_network_recovery_begin != NULL &&
       robot_voice_http_network_recovery_end != NULL)
     {
       if (!robot_voice_http_network_recovery_begin())
         {
+          network_release_http_transport();
           return;
         }
       recovery_started = true;
@@ -338,6 +389,7 @@ void robot_voice_wifi_poll(void)
         {
           robot_voice_http_network_recovery_end();
         }
+      network_release_http_transport();
       return;
     }
 
@@ -401,6 +453,7 @@ void robot_voice_wifi_poll(void)
     {
       robot_voice_http_network_recovery_end();
     }
+  network_release_http_transport();
 }
 
 void robot_voice_http_network_diag(void) { network_wifi_diag(); }

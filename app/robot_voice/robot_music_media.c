@@ -22,7 +22,6 @@
 #include <unistd.h>
 
 extern int robot_oled_set_loading(bool loading) __attribute__((weak));
-extern int robot_voice_speak_notice(const char *text) __attribute__((weak));
 
 #define MEDIA_EVENT_STOPPED 4
 #define MEDIA_EVENT_COMPLETED 6
@@ -30,6 +29,7 @@ extern int robot_voice_speak_notice(const char *text) __attribute__((weak));
 #define MUSIC_TAIL_INTERVAL_MS 1000ULL
 
 extern unsigned long robot_voice_music_run_id(void) __attribute__((weak));
+extern void robot_voice_music_started(void) __attribute__((weak));
 
 struct rv_music_handle
 {
@@ -49,7 +49,7 @@ struct rv_music_handle
   bool companion_calm;
   bool companion_tail;
   uint32_t companion_event_id;
-  uint32_t face_index;
+  uint32_t confirm_worker_session; /* reuses the former unused face index */
   uint64_t next_face_ms;
   uint64_t next_tail_ms;
   uint64_t next_tail_log_ms;
@@ -114,9 +114,9 @@ static void robot_music_media_event_bridge(void *cookie, int event,
   robot_music_event_cb callback;
   void *callback_cookie;
 
-  /* The backend snapshots callbacks onto detached event workers. A numeric
-   * cookie lookup keeps callbacks queued before close from dereferencing a
-   * freed wrapper; cookie values are never recycled during normal use. */
+  /* Numeric cookies reject superseded sessions and callbacks racing close.
+   * The callback reference pins the wrapper while upper state is updated;
+   * values are never recycled during normal use. */
   pthread_mutex_lock(&g_music_lock);
   for (handle = g_music_handles; handle != NULL; handle = handle->next)
     if (handle->cookie_id == (uintptr_t)cookie) break;
@@ -221,20 +221,25 @@ static void *robot_music_confirm_worker(void *arg)
                      !handle->stopping && handle->started && g_active_music == handle;
       pthread_mutex_unlock(&g_music_lock);
       if (!current) break;
+      if (!robot_legacy_media_is_running(handle->player))
+        { usleep(100 * 1000); continue; }
       ret = robot_audio_playback_progress(&completed, &pending);
       if (ret == 0 && completed != 0)
         {
           pthread_mutex_lock(&g_music_lock);
           if (handle->session_id == session &&
               !handle->closing && !handle->stopping && handle->started &&
-              g_active_music == handle && !handle->announced)
+              g_active_music == handle && !handle->announced &&
+              robot_legacy_media_is_running(handle->player))
             {
               ret = robot_proactive_music_session_update(ROBOT_MUSIC_PLAYING,
                 handle->session_id, handle->track, "", "", 0);
               handle->announced = true;
-              handle->companion_enabled = true;
+              /* Authorization comes from the Agent's local Skill dispatch,
+               * never from a pre-enabled event_id=0 shortcut. */
+              handle->companion_enabled = false;
               handle->companion_calm = false;
-              handle->companion_tail = true;
+              handle->companion_tail = false;
               handle->companion_event_id = 0;
               handle->loading = false;
               handle->next_tail_ms = 0;
@@ -261,10 +266,43 @@ static void *robot_music_confirm_worker(void *arg)
       usleep(100 * 1000);
     }
   pthread_mutex_lock(&g_music_lock);
+  if (handle->confirm_worker_session == session) handle->confirm_worker_session = 0;
   handle->users--;
   pthread_cond_broadcast(&g_music_changed);
   pthread_mutex_unlock(&g_music_lock);
   return NULL;
+}
+
+/* Defer the existing policy worker until actual audio start. A staged song
+ * must not consume this stack while the foreground reply is still speaking. */
+static int robot_music_start_confirm_locked(struct rv_music_handle *handle)
+{
+  pthread_t thread;
+  pthread_attr_t attr;
+  int ret;
+  if (!robot_legacy_media_is_running(handle->player) ||
+      handle->confirm_worker_session == handle->session_id) return 0;
+  struct rv_music_worker_arg *worker = malloc(sizeof(*worker));
+  if (!worker) return -ENOMEM;
+  worker->handle = handle;
+  worker->session_id = handle->session_id;
+  handle->users++;
+  handle->confirm_worker_session = handle->session_id;
+  ret = pthread_attr_init(&attr);
+  if (!ret) {
+    ret = pthread_attr_setstacksize(&attr, MUSIC_CONFIRM_STACK);
+    if (!ret) ret = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (!ret) ret = pthread_create(&thread, &attr, robot_music_confirm_worker, worker);
+    pthread_attr_destroy(&attr);
+  }
+  if (ret) {
+    free(worker);
+    handle->users--;
+    handle->confirm_worker_session = 0;
+    syslog(LOG_WARNING, "[ROBOT-MUSIC] companion worker unavailable rc=%d\n", ret);
+    return -ret;
+  }
+  return 0;
 }
 
 void *robot_music_media_open(const char *stream)
@@ -337,15 +375,9 @@ int robot_music_media_prepare(void *opaque, const char *url, const char *options
 {
   struct rv_music_handle *handle = opaque;
   int ret;
-  int notice_ret;
-  char title[64];
-  char artist[64];
-  char announcement[192];
   if (handle == NULL) return -EINVAL;
 
-  /* Mark the complete prepare window, including DNS/TLS and demux setup, as
-   * loading. Prepare starts the network producer before the spoken notices so
-   * the HTTP/MP3 cache can fill while the notices are playing. */
+  /* Loading is visual. Do not launch cloud speech while preparing music. */
   robot_music_loading(true);
   pthread_mutex_lock(&g_music_lock);
   handle->loading = true;
@@ -358,42 +390,7 @@ int robot_music_media_prepare(void *opaque, const char *url, const char *options
       snprintf(handle->track, sizeof(handle->track), "%s", url != NULL ? url : "local PCM");
       for (char *p = handle->track; *p; p++)
         if (*p == '\n' || *p == '\r') *p = ' ';
-      snprintf(title, sizeof(title), "%s", handle->title);
-      snprintf(artist, sizeof(artist), "%s", handle->artist);
       pthread_mutex_unlock(&g_music_lock);
-
-      if (robot_voice_speak_notice != NULL)
-        {
-          if (title[0] != '\0' && artist[0] != '\0')
-            {
-              snprintf(announcement, sizeof(announcement),
-                       "歌曲%s，歌手%s", title, artist);
-            }
-          else if (title[0] != '\0')
-            {
-              snprintf(announcement, sizeof(announcement), "歌曲%s", title);
-            }
-          else
-            {
-              announcement[0] = '\0';
-            }
-
-          if (announcement[0] != '\0')
-            {
-              notice_ret = robot_voice_speak_notice(announcement);
-              if (notice_ret < 0)
-                {
-                  printf("[RV-MUSIC] track info TTS skipped rc=%d\n",
-                         notice_ret);
-                }
-            }
-
-          notice_ret = robot_voice_speak_notice("正在加载中");
-          if (notice_ret < 0)
-            {
-              printf("[RV-MUSIC] loading TTS skipped rc=%d\n", notice_ret);
-            }
-        }
     }
   else
     {
@@ -421,10 +418,7 @@ int robot_music_media_set_event_callback(void *opaque, void *cookie,
 int robot_music_media_start(void *opaque)
 {
   struct rv_music_handle *handle = opaque;
-  pthread_t thread;
-  pthread_attr_t attr;
   int ret;
-  int confirm_ret;
   unsigned long run;
   if (handle == NULL) return -EINVAL;
   (void)robot_proactive_start();
@@ -432,6 +426,20 @@ int robot_music_media_start(void *opaque)
    * hold that lock when querying music, so never call it under g_music_lock. */
   run = robot_voice_music_run_id != NULL ? robot_voice_music_run_id() : 0;
   pthread_mutex_lock(&g_music_lock);
+  if (!handle->closing && handle->started && !handle->starting &&
+      robot_legacy_media_is_paused(handle->player))
+    {
+      handle->users++;
+      pthread_mutex_unlock(&g_music_lock);
+      ret = robot_legacy_media_start(handle->player);
+      pthread_mutex_lock(&g_music_lock);
+      if (ret == 0) (void)robot_music_start_confirm_locked(handle);
+      handle->users--;
+      pthread_cond_broadcast(&g_music_changed);
+      pthread_mutex_unlock(&g_music_lock);
+      if (ret == 0 && robot_voice_music_started) robot_voice_music_started();
+      return ret;
+    }
   if (handle->closing || handle->started || handle->starting)
     { pthread_mutex_unlock(&g_music_lock); return -EBUSY; }
   handle->starting = true;
@@ -443,8 +451,13 @@ int robot_music_media_start(void *opaque)
   handle->session_id = ++g_next_session;
   if (handle->session_id == 0) handle->session_id = ++g_next_session;
   handle->run = run;
+  handle->cookie_id = ++g_next_cookie;
+  if (handle->cookie_id == 0) handle->cookie_id = ++g_next_cookie;
+  uintptr_t cookie_id = handle->cookie_id;
   handle->users++;
   pthread_mutex_unlock(&g_music_lock);
+  (void)robot_legacy_media_set_event_callback(handle->player,
+    (void *)cookie_id, robot_music_media_event_bridge);
   ret = robot_legacy_media_start(handle->player);
   if (ret < 0)
     {
@@ -460,30 +473,12 @@ int robot_music_media_start(void *opaque)
     {
       handle->started = true;
       g_active_music = handle;
-      struct rv_music_worker_arg *worker = malloc(sizeof(*worker));
-      if (worker != NULL)
-        { worker->handle = handle; worker->session_id = handle->session_id; }
-      handle->users++; /* confirmation/policy worker reference */
-      confirm_ret = worker != NULL ? pthread_attr_init(&attr) : ENOMEM;
-      if (confirm_ret == 0)
-        {
-          confirm_ret = pthread_attr_setstacksize(&attr, MUSIC_CONFIRM_STACK);
-          if (confirm_ret == 0)
-            confirm_ret = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-          if (confirm_ret == 0)
-            confirm_ret = pthread_create(&thread, &attr, robot_music_confirm_worker, worker);
-          pthread_attr_destroy(&attr);
-        }
-      if (confirm_ret != 0)
-        {
-          free(worker);
-          handle->users--;
-          syslog(LOG_WARNING, "[ROBOT-MUSIC] confirm worker unavailable rc=%d; music continues\n", confirm_ret);
-        }
+      (void)robot_music_start_confirm_locked(handle);
     }
   handle->users--;
   pthread_cond_broadcast(&g_music_changed);
   pthread_mutex_unlock(&g_music_lock);
+  if (ret == 0 && robot_voice_music_started) robot_voice_music_started();
   return ret;
 }
 
@@ -541,11 +536,18 @@ bool robot_music_media_owns_reply(unsigned long run)
   pthread_mutex_unlock(&g_music_lock);
   return owns;
 }
+bool robot_music_media_start_pending(void *opaque)
+{
+  struct rv_music_handle *handle = opaque;
+  return handle != NULL && robot_legacy_media_start_pending(handle->player);
+}
+
 bool robot_music_media_is_active(void)
 {
   bool active;
   pthread_mutex_lock(&g_music_lock);
-  active = g_active_music != NULL && g_active_music->started && !g_active_music->closing;
+  active = g_active_music != NULL && g_active_music->started && !g_active_music->closing &&
+           robot_legacy_media_is_running(g_active_music->player);
   pthread_mutex_unlock(&g_music_lock);
   return active;
 }
@@ -589,7 +591,7 @@ bool robot_music_media_motion_allowed(uint32_t session_id)
            g_active_music->session_id == session_id;
   pthread_mutex_unlock(&g_music_lock);
 
-  return active && state.proactive_enabled && !state.power_risk &&
+  return active && robot_music_media_session_ready(session_id) && state.proactive_enabled && !state.power_risk &&
          !state.tts_active && !state.conversation_active &&
          robot_audio_playback_music_audible();
 }
@@ -632,7 +634,8 @@ int robot_music_media_companion_start(uint32_t session_id, uint32_t event_id,
       state.music_event_id == event_id)
     {
       struct rv_music_handle *handle = g_active_music;
-      if (handle->companion_enabled) ret = -EALREADY;
+      if (handle->companion_enabled && handle->companion_event_id == event_id)
+        ret = -EALREADY;
       else
         {
           handle->companion_calm = calm;
@@ -641,7 +644,6 @@ int robot_music_media_companion_start(uint32_t session_id, uint32_t event_id,
           handle->next_face_ms = 0;
           handle->next_tail_ms = 0;
           handle->next_tail_log_ms = 0;
-          handle->face_index = 0;
           handle->companion_enabled = true;
           ret = 0;
           printf("[ROBOT-MUSIC] companion armed session=%lu event=%lu tail=%d tail_step_ms=%llu\n",
@@ -664,7 +666,7 @@ int robot_music_media_claim_periodic_tail(uint32_t session_id, uint32_t event_id
   pthread_mutex_unlock(&g_music_lock);
   if (!authorized) return -ESTALE;
   if (!robot_music_media_motion_allowed(session_id)) return -EAGAIN;
-  if (event_id == 0) return 0;
+  if (event_id == 0) return -ESTALE;
   return robot_world_state_claim_music_tail_repeat(session_id, event_id);
 }
 
@@ -691,3 +693,66 @@ int robot_music_media_stop_for_voice(unsigned long run)
 { return robot_music_media_stop_borrowed(run); }
 int robot_media_stop_active(void)
 { return robot_music_media_stop_borrowed(0); }
+
+/* These are task-level operations. The WebClient callback never waits for
+ * TTS: suspend joins the HTTP/decode owner and closes I2S before returning. */
+bool robot_music_media_has_task(void)
+{
+  bool active;
+  pthread_mutex_lock(&g_music_lock);
+  active = g_active_music && g_active_music->started && !g_active_music->closing;
+  pthread_mutex_unlock(&g_music_lock);
+  return active;
+}
+
+int robot_music_media_suspend(void)
+{
+  struct rv_music_handle *handle;
+  int ret;
+  pthread_mutex_lock(&g_music_lock);
+  handle = g_active_music;
+  if (!handle || !handle->started || handle->closing)
+    { pthread_mutex_unlock(&g_music_lock); return 0; }
+  handle->users++;
+  pthread_mutex_unlock(&g_music_lock);
+  ret = robot_legacy_media_suspend(handle->player);
+  pthread_mutex_lock(&g_music_lock);
+  handle->next_tail_log_ms = 0; /* Reuse this timer for failed-resume backoff. */
+  handle->users--;
+  pthread_cond_broadcast(&g_music_changed);
+  pthread_mutex_unlock(&g_music_lock);
+  if (ret == 0) {
+    (void)robot_expression_clear(ROBOT_EXPRESSION_SOURCE_MUSIC);
+  }
+  return ret;
+}
+
+int robot_music_media_resume(void)
+{
+  struct rv_music_handle *handle;
+  uint64_t now = robot_music_now_ms();
+  int ret;
+  bool running;
+  pthread_mutex_lock(&g_music_lock);
+  handle = g_active_music;
+  if (!handle || !handle->started || handle->closing || handle->stopping ||
+      robot_legacy_media_is_running(handle->player))
+    { pthread_mutex_unlock(&g_music_lock); return 0; }
+  if (now < handle->next_tail_log_ms)
+    { pthread_mutex_unlock(&g_music_lock); return -EAGAIN; }
+  handle->users++;
+  pthread_mutex_unlock(&g_music_lock);
+  ret = robot_legacy_media_resume_active();
+  running = robot_legacy_media_is_running(handle->player);
+  pthread_mutex_lock(&g_music_lock);
+  handle->next_tail_log_ms = ret < 0 ? now + 1000 : 0;
+  if (running) (void)robot_music_start_confirm_locked(handle);
+  if (running && handle->announced)
+    (void)robot_expression_set(ROBOT_EXPRESSION_SOURCE_MUSIC,
+                               ROBOT_EXPRESSION_SINGING, 0);
+  handle->users--;
+  pthread_cond_broadcast(&g_music_changed);
+  pthread_mutex_unlock(&g_music_lock);
+  if (running && robot_voice_music_started) robot_voice_music_started();
+  return ret;
+}

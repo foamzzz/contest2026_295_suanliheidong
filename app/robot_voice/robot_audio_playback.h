@@ -41,6 +41,9 @@ int robot_audio_playback_write(const uint8_t *pcm, size_t len);
 size_t robot_audio_playback_buffered_bytes(void);
 int robot_audio_playback_finish(void);
 void robot_audio_playback_close(void);
+/* Freeze DMA and wake blocked producers, without freeing their live ring.
+ * The current owner must join its producer(s), then call close(). */
+uint64_t robot_audio_playback_cancel(void);
 
 #ifdef __cplusplus
 }

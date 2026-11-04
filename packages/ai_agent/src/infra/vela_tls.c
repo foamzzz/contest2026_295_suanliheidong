@@ -16,6 +16,7 @@
 
 #include "infra/vela_tls.h"
 #include "infra/http_proxy.h"
+#include "infra/network_manager.h"
 #include "agent_compat.h"
 #include "agent_config.h"
 
@@ -25,6 +26,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +64,8 @@ static int simple_entropy_func(void* data, unsigned char* output, size_t len)
 }
 
 static const char* TAG = "vela_tls";
+extern void robot_voice_http_network_result(int result, bool connect_failure)
+    __attribute__((weak));
 
 /* The contest WLAN netcard uses a 590-byte packet buffer.  Keep encrypted
  * application records below its TCP payload budget so a large audio upload
@@ -1127,6 +1131,10 @@ int vela_https_request(
     syslog(LOG_INFO, "[%s] transport leave: %s:%s rc=%d\n", TAG, host,
         port, ret);
     pthread_mutex_unlock(&s_transport_lock);
+    /* A successful Agent/Feishu request proves the shared WLAN path has
+     * recovered; do not let old contest-client errors trigger a stale reset. */
+    if (ret >= 100 && robot_voice_http_network_result != NULL)
+        robot_voice_http_network_result(ret, false);
     network_release_http_transport();
     return ret;
 }
@@ -1288,6 +1296,8 @@ int vela_https_post_json_stream(const char *host, const char *port,
     syslog(LOG_INFO, "[%s] streaming transport leave: %s:%s rc=%d\n", TAG,
         host, port, ret);
     pthread_mutex_unlock(&s_transport_lock);
+    if (ret >= 100 && robot_voice_http_network_result != NULL)
+        robot_voice_http_network_result(ret, false);
     network_release_http_transport();
     return ret;
 }

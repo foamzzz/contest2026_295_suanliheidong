@@ -2,6 +2,7 @@
 #define ROBOT_MEDIA_PLAYER_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <sys/types.h>
 
 typedef void (*robot_media_event_callback)(void *cookie, int event,
@@ -15,6 +16,11 @@ int robot_legacy_media_set_event_callback(void *handle, void *cookie,
 int robot_legacy_media_start(void *handle);
 int robot_legacy_media_stop(void *handle);
 int robot_legacy_media_pause(void *handle);
+int robot_legacy_media_suspend(void *handle);
+int robot_legacy_media_resume_active(void);
+bool robot_legacy_media_start_pending(void *handle);
+bool robot_legacy_media_is_running(void *handle);
+bool robot_legacy_media_is_paused(void *handle);
 int robot_legacy_media_seek(void *handle, unsigned int position);
 int robot_legacy_media_get_position(void *handle, unsigned int *position);
 int robot_legacy_media_get_duration(void *handle, unsigned int *duration);

@@ -88,3 +88,10 @@ void tool_media_cleanup(void);
 
 int tool_music_search_execute(const char* input_json,
     char* output, size_t output_size);
+
+/* Agent turn spans tool execution, channel delivery and drained TTS.
+ * Uses the contest's shared robot_task scope when linked. Other backends use
+ * the event-confirmed pause fallback. End only after a successful begin. */
+int tool_media_task_begin(void);
+void tool_media_task_end(int allow_resume);
+int tool_media_music_busy(void);

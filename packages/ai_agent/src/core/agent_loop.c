@@ -35,6 +35,10 @@
 #include "tools/skill_loader.h"
 #include "tools/tool_guard.h"
 #include "tools/tool_registry.h"
+#include "tools/tool_media.h"
+#ifdef CONFIG_AI_AGENT_FEISHU
+#include "channels/feishu_bot.h"
+#endif
 #include "agent_compat.h"
 #include "agent_config.h"
 
@@ -54,9 +58,9 @@ static const char* TAG = "agent";
  * the Agent package usable when the voice module is not linked. */
 extern int robot_voice_speak_notice(const char *text) __attribute__((weak));
 extern int voice_channel_init(void) __attribute__((weak));
+extern int robot_proactive_apply_music_skill(const char *) __attribute__((weak));
 
 #define TOOL_OUTPUT_SIZE (8 * 1024)
-#define TOOL_OUTPUT_SIZE_LARGE (16 * 1024)
 #define TOOL_OUTPUT_SIZE_MIN (2 * 1024)
 
 /* ── Forward declarations ──────────────────────────────────── */
@@ -96,11 +100,6 @@ static inline uint64_t monotonic_elapsed_ms(uint64_t start, uint64_t end)
 {
     return start != 0 && end != 0 && end >= start ? end - start : 0;
 }
-
-/* ── Memory pool (pre-allocated tool output buffers) ───────── */
-
-static agent_mem_pool_t s_tool_pool;
-static bool s_pool_ready = false;
 
 /* Build OpenAI-format assistant message with tool_calls at the top level */
 static void add_assistant_message(cJSON* messages, const llm_response_t* resp)
@@ -167,150 +166,31 @@ static char* inject_cron_context(const char* tool_name,
     return patched;
 }
 
-/* Parallel tool execution context */
-typedef struct {
-    const llm_tool_call_t* call;
-    char* output;
-    size_t output_size;
-    bool from_pool;
-    char channel[16];
-    char chat_id[64];
-} tool_task_t;
-
-static void* tool_exec_thread(void* arg)
-{
-    tool_task_t* t = (tool_task_t*)arg;
-
-    t->output[0] = '\0';
-    char* patched = inject_cron_context(
-        t->call->name, t->call->input, t->channel, t->chat_id);
-    agent_tool_exec_streamed(t->call->name,
-        patched ? patched : t->call->input,
-        t->output, t->output_size);
-    free(patched);
-    syslog(LOG_INFO, "[%s] Tool %s result: %d bytes\n",
-        TAG, t->call->name, (int)strlen(t->output));
-    return NULL;
-}
-
-/* Add one role:"tool" message per tool result (OpenAI format).
- * When call_count > 1, all tools run in parallel threads.
- * Uses memory pool for parallel buffers, with heap fallback. */
+/* One scheduler executes tools in declared order. Reuse tool_output instead
+ * of allocating per-tool outputs and temporary worker stacks. */
 static void add_tool_result_messages(cJSON* messages,
     const llm_response_t* resp, char* tool_output,
     size_t tool_output_size, const char* msg_channel,
     const char* msg_chat_id)
 {
-    int n = resp->call_count;
-
-    if (n == 1) {
-        const llm_tool_call_t* call = &resp->calls[0];
-
-        syslog(LOG_INFO, "[%s] Tool call: %s args=%.500s\n", TAG,
-            call->name, call->input ? call->input : "(null)");
+    for (int i = 0; i < resp->call_count; i++) {
+        const llm_tool_call_t *call = &resp->calls[i];
+        bool duplicate = false;
+        for (int j = 0; j < i; j++) {
+            if (strcmp(resp->calls[j].id, call->id) == 0) duplicate = true;
+        }
+        if (duplicate) continue;
         tool_output[0] = '\0';
-        char* patched = inject_cron_context(
-            call->name, call->input, msg_channel, msg_chat_id);
-        agent_tool_exec_streamed(call->name,
-            patched ? patched : call->input,
-            tool_output, tool_output_size);
+        char *patched = inject_cron_context(call->name, call->input,
+                                           msg_channel, msg_chat_id);
+        agent_tool_exec_streamed(call->name, patched ? patched : call->input,
+                                 tool_output, tool_output_size);
         free(patched);
-        syslog(LOG_INFO, "[%s] Tool %s result: %d bytes\n", TAG,
-            call->name, (int)strlen(tool_output));
-
-        cJSON* result_msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(result_msg, "role", "tool");
-        cJSON_AddStringToObject(result_msg, "tool_call_id", call->id);
-        cJSON_AddStringToObject(result_msg, "content", tool_output);
-        cJSON_AddItemToArray(messages, result_msg);
-        return;
-    }
-
-    /* Parallel path */
-    tool_task_t tasks[AGENT_MAX_TOOL_CALLS];
-    pthread_t threads[AGENT_MAX_TOOL_CALLS];
-    size_t par_buf_size = agent_mem_safe_size(
-        TOOL_OUTPUT_SIZE_LARGE, TOOL_OUTPUT_SIZE_MIN);
-
-    for (int i = 0; i < n; i++) {
-        tasks[i].call = &resp->calls[i];
-        strncpy(tasks[i].channel, msg_channel ? msg_channel : "",
-            sizeof(tasks[i].channel) - 1);
-        strncpy(tasks[i].chat_id, msg_chat_id ? msg_chat_id : "",
-            sizeof(tasks[i].chat_id) - 1);
-
-        char* buf = s_pool_ready
-            ? agent_pool_acquire(&s_tool_pool)
-            : NULL;
-        if (buf) {
-            tasks[i].output = buf;
-            tasks[i].output_size = s_tool_pool.buf_size;
-            tasks[i].from_pool = true;
-        } else {
-            tasks[i].output = calloc(1, par_buf_size);
-            tasks[i].output_size = par_buf_size;
-            tasks[i].from_pool = false;
-        }
-
-        if (!tasks[i].output) {
-            threads[i] = 0;
-            continue;
-        }
-
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setstacksize(&attr, 16 * 1024);
-        if (pthread_create(&threads[i], &attr,
-                tool_exec_thread, &tasks[i])
-            != 0) {
-            syslog(LOG_ERR, "[%s] Failed to spawn thread for tool %s\n",
-                TAG, resp->calls[i].name);
-            threads[i] = 0;
-        }
-        pthread_attr_destroy(&attr);
-    }
-
-    /* Join and collect results, dedup by tool_call_id */
-    char seen_ids[AGENT_MAX_TOOL_CALLS][32];
-    int seen_count = 0;
-
-    for (int i = 0; i < n; i++) {
-        if (threads[i]) {
-            pthread_join(threads[i], NULL);
-        }
-
-        bool dup = false;
-        for (int j = 0; j < seen_count; j++) {
-            if (strcmp(seen_ids[j], resp->calls[i].id) == 0) {
-                dup = true;
-                break;
-            }
-        }
-
-        if (dup) {
-            syslog(LOG_WARNING,
-                "[%s] Skipping duplicate tool_call_id: %s\n",
-                TAG, resp->calls[i].id);
-        } else {
-            strncpy(seen_ids[seen_count++], resp->calls[i].id,
-                sizeof(seen_ids[0]) - 1);
-
-            cJSON* result_msg = cJSON_CreateObject();
-            cJSON_AddStringToObject(result_msg, "role", "tool");
-            cJSON_AddStringToObject(result_msg, "tool_call_id",
-                resp->calls[i].id);
-            cJSON_AddStringToObject(result_msg, "content",
-                (tasks[i].output && tasks[i].output[0])
-                    ? tasks[i].output
-                    : "{}");
-            cJSON_AddItemToArray(messages, result_msg);
-        }
-
-        if (tasks[i].from_pool) {
-            agent_pool_release(&s_tool_pool, tasks[i].output);
-        } else {
-            free(tasks[i].output);
-        }
+        cJSON *result = cJSON_CreateObject();
+        cJSON_AddStringToObject(result, "role", "tool");
+        cJSON_AddStringToObject(result, "tool_call_id", call->id);
+        cJSON_AddStringToObject(result, "content", tool_output);
+        cJSON_AddItemToArray(messages, result);
     }
 }
 
@@ -532,7 +412,7 @@ static void feishu_music_keyword(const char* text, char* keyword,
     }
 }
 
-static void feishu_motion_speak_notice(const char* text, const char* phase)
+static void motion_speak_notice(const char* text, const char* phase)
 {
     int rc;
 
@@ -543,86 +423,84 @@ static void feishu_motion_speak_notice(const char* text, const char* phase)
     rc = robot_voice_speak_notice(text);
     if (rc < 0) {
         syslog(LOG_WARNING,
-            "[%s] Feishu motion %s notice skipped rc=%d\n",
+            "[%s] motion %s notice skipped rc=%d\n",
             TAG, phase, rc);
     }
 }
 
+/* Explicit physical movement requests should not depend on an LLM deciding
+ * to emit a tool call.  Voice and Feishu both use this bounded path so a
+ * phrase such as "向前一步走" always reaches the same guarded motion tool. */
+static char* handle_motion_fast_path(const char* text)
+{
+    const char* direction = feishu_motion_direction(text);
+    char result[512] = { 0 };
+    char input[128];
+    char notice[96];
+    const char* motion_name;
+    int rc;
+
+    if (direction == NULL) {
+        return NULL;
+    }
+
+    motion_name = strcmp(direction, "forward") == 0 ? "向前"
+        : strcmp(direction, "backward") == 0 ? "向后"
+        : strcmp(direction, "left") == 0 ? "向左" : "向右";
+    snprintf(notice, sizeof(notice), "正在执行%s一步", motion_name);
+    motion_speak_notice(notice, "start");
+
+    snprintf(input, sizeof(input),
+        "{\"direction\":\"%s\",\"steps\":1}", direction);
+    rc = tool_registry_execute("robot_move", input, result, sizeof(result));
+    if (rc != OK && strstr(result, "unknown tool 'robot_move'") != NULL &&
+        voice_channel_init != NULL) {
+        /* The contest voice application owns this provider.  Its initializer
+         * is idempotent, so cover a first-message registration race. */
+        int init_rc = voice_channel_init();
+        if (init_rc == OK) {
+            result[0] = '\0';
+            rc = tool_registry_execute("robot_move", input, result,
+                sizeof(result));
+        }
+    }
+
+    s_fast_path_count++;
+    syslog(LOG_INFO,
+        "[%s] motion fast path: direction=%s rc=%d\n", TAG, direction, rc);
+
+    if (rc == OK && strstr(result, "\"ok\":true") != NULL) {
+        motion_speak_notice("动作执行完毕", "completion");
+        return strdup("动作执行完毕");
+    }
+
+    if (strstr(result, "network unavailable") != NULL) {
+        motion_speak_notice("网络异常，请稍后再试", "failure");
+    } else {
+        motion_speak_notice("动作执行失败", "failure");
+    }
+
+    char* reply = calloc(1, 512);
+    if (reply != NULL) {
+        if (strstr(result, "network unavailable") != NULL) {
+            snprintf(reply, 512, "网络异常，请稍后再试");
+        } else {
+            snprintf(reply, 512, "执行移动失败：%s",
+                result[0] != '\0' ? result : "机器人动作工具不可用");
+        }
+    }
+    return reply;
+}
+
 static char* handle_feishu_action_fast_path(agent_msg_t* msg)
 {
-    const char* direction;
-
     if (msg == NULL || strcmp(msg->channel, AGENT_CHAN_FEISHU) != 0
         || msg->content == NULL || msg->content[0] == '\0') {
         return NULL;
     }
 
-    direction = feishu_motion_direction(msg->content);
-    if (direction != NULL) {
-        char result[512] = { 0 };
-        char input[128];
-        char notice[96];
-        const char* motion_name;
-        int rc;
-
-        motion_name = strcmp(direction, "forward") == 0 ? "向前"
-            : strcmp(direction, "backward") == 0 ? "向后"
-            : strcmp(direction, "left") == 0 ? "向左" : "向右";
-        snprintf(notice, sizeof(notice), "正在执行%s一步", motion_name);
-        feishu_motion_speak_notice(notice, "start");
-
-        snprintf(input, sizeof(input),
-            "{\"direction\":\"%s\",\"steps\":1}", direction);
-        rc = tool_registry_execute("robot_move", input, result,
-            sizeof(result));
-        if (rc != OK && strstr(result, "unknown tool 'robot_move'") != NULL &&
-            voice_channel_init != NULL) {
-            /* The voice application owns the contest-local providers.  A
-             * Feishu event can race its first initialization, so retry the
-             * idempotent initializer before reporting a missing tool. */
-            int init_rc = voice_channel_init();
-            if (init_rc == OK) {
-                result[0] = '\0';
-                rc = tool_registry_execute("robot_move", input, result,
-                    sizeof(result));
-            }
-        }
-        s_fast_path_count++;
-        syslog(LOG_INFO,
-            "[%s] Feishu action fast path: robot_move direction=%s rc=%d\n",
-            TAG, direction, rc);
-
-        if (rc == OK && strstr(result, "\"ok\":true") != NULL) {
-            feishu_motion_speak_notice("动作执行完毕", "completion");
-            char* reply = calloc(1, 256);
-            if (reply != NULL) {
-                snprintf(reply, 256, "动作执行完毕");
-            }
-            return reply;
-        }
-
-        if (strstr(result, "network unavailable") != NULL)
-            {
-                feishu_motion_speak_notice("网络异常，请稍后再试", "failure");
-            }
-        else
-            {
-                feishu_motion_speak_notice("动作执行失败", "failure");
-            }
-
-        char* reply = calloc(1, 512);
-        if (reply != NULL) {
-            if (strstr(result, "network unavailable") != NULL)
-                {
-                    snprintf(reply, 512, "网络异常，请稍后再试");
-                }
-            else
-                {
-                    snprintf(reply, 512, "执行移动失败：%s",
-                        result[0] != '\0' ? result : "机器人动作工具不可用");
-                }
-        }
-        return reply;
+    if (feishu_motion_direction(msg->content) != NULL) {
+        return handle_motion_fast_path(msg->content);
     }
 
     if (contains_any(msg->content,
@@ -698,6 +576,11 @@ static char* handle_feishu_action_fast_path(agent_msg_t* msg)
             cJSON_Delete(search_json);
             return reply;
         }
+
+        /* Music is the audible response to this command. Speaking the
+         * acknowledgement locally can hold the task scope longer than a
+         * short requested play window, so keep the Feishu reply text-only. */
+        msg->flags |= AGENT_MSG_FLAG_NO_TTS;
 
         unsigned int stop_seconds = feishu_music_stop_seconds(msg->content);
         bool stop_scheduled = false;
@@ -1306,10 +1189,9 @@ static void dispatch_response(const agent_msg_t* msg,
             sizeof(out.chat_id) - 1);
         out.flags = msg->flags;
         out.content = final_text;
-        if (message_bus_push_outbound(&out) != OK) {
+        agent_oled_enqueue(final_text);
+        if (message_bus_reply_and_wait(&out) != OK) {
             free(final_text);
-        } else {
-            agent_oled_enqueue(final_text);
         }
     } else {
         free(final_text);
@@ -1321,7 +1203,7 @@ static void dispatch_response(const agent_msg_t* msg,
         out.flags = msg->flags;
         out.content = strdup("Sorry, I encountered an error.");
         if (out.content) {
-            if (message_bus_push_outbound(&out) != OK) {
+            if (message_bus_reply_and_wait(&out) != OK) {
                 free(out.content);
             }
         }
@@ -1358,6 +1240,7 @@ static void send_working_status(const agent_msg_t* msg, int iteration)
     }
 
     agent_msg_t status = { 0 };
+    status.flags = AGENT_MSG_FLAG_TASK_STATUS | AGENT_MSG_FLAG_NO_TTS;
 
     strncpy(status.channel, msg->channel, sizeof(status.channel) - 1);
     strncpy(status.chat_id, msg->chat_id, sizeof(status.chat_id) - 1);
@@ -1723,10 +1606,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         /* Local tool shortcut: if the single tool in this round is a
          * local file op, skip the next LLM round and use the tool
          * output directly as the reply. Saves ~2s.
-         * Restricted to call_count == 1: the parallel path does not
-         * write into tool_output, so multi-call rounds must go through
-         * the LLM to aggregate results (and tool_output would be stale
-         * from a prior iteration if we allowed call_count > 1 here). */
+         * Multi-call rounds still need the LLM to aggregate all tool
+         * results; tool_output contains only the last tool's result. */
         if (resp.call_count == 1) {
             bool all_local = true;
             for (int i = 0; i < resp.call_count; i++) {
@@ -1901,20 +1782,6 @@ static void* agent_loop_task(void* arg)
     syslog(LOG_INFO, "[%s] Buffers: ctx=%zu hist=%zu tool=%zu\n",
         TAG, ctx_size, hist_size, tool_size);
 
-    /* Initialize memory pool for parallel tool outputs */
-    size_t pool_buf_size = agent_mem_safe_size(
-        TOOL_OUTPUT_SIZE_LARGE, TOOL_OUTPUT_SIZE_MIN);
-    if (agent_pool_init(&s_tool_pool, pool_buf_size,
-            AGENT_MAX_TOOL_CALLS)
-        == OK) {
-        s_pool_ready = true;
-        syslog(LOG_INFO, "[%s] Tool output pool: %d x %zu bytes\n",
-            TAG, AGENT_MAX_TOOL_CALLS, pool_buf_size);
-    } else {
-        syslog(LOG_WARNING,
-            "[%s] Pool init failed, using heap fallback\n", TAG);
-    }
-
     char* tools_json = tool_registry_get_tools_json();
 
     syslog(LOG_INFO, "[%s] Tools JSON loaded: %d bytes\n",
@@ -1937,6 +1804,73 @@ static void* agent_loop_task(void* arg)
         syslog(LOG_INFO, "[%s] Processing message from %s:%s\n",
             TAG, msg.channel, msg.chat_id);
 
+        /* Confirmed music events execute the local companion Skill on the
+         * Agent scheduler. Do not enter a foreground scope: that would pause
+         * the very song whose tail policy is being armed. Never parse raw
+         * Skill prose with keyword paths or invoke LLM/TTS for this event. */
+        if ((msg.flags & AGENT_MSG_FLAG_INTERNAL_MUSIC) != 0) {
+            if (robot_proactive_apply_music_skill &&
+                strcmp(msg.chat_id, "robot_music_companion") == 0) {
+                int rc = robot_proactive_apply_music_skill(msg.content);
+                syslog(rc == 0 || rc == -ESTALE ? LOG_INFO : LOG_WARNING,
+                    "[%s] Local music Skill dispatched rc=%d\n", TAG, rc);
+            }
+            message_bus_msg_free(&msg);
+            continue;
+        }
+
+        /* Hold resources through the synchronous outbound acknowledgement.
+         * A failed pause closes music; report the handoff failure without LLM. */
+        int task_rc = tool_media_task_begin();
+        char *reply = NULL;
+        if (msg.flags & (AGENT_MSG_FLAG_MUSIC_PAUSE |
+                         AGENT_MSG_FLAG_MUSIC_STOP))
+            msg.flags |= AGENT_MSG_FLAG_NO_TTS;
+        if (task_rc != OK) {
+            msg.flags |= AGENT_MSG_FLAG_NO_TTS;
+            reply = strdup("当前资源交接未完成，本次指令未执行，请稍后重试。");
+            if (!reply) goto task_done;
+        }
+
+#ifdef CONFIG_AI_AGENT_FEISHU
+        if (!reply && (msg.flags & AGENT_MSG_FLAG_FEISHU_IMAGE)) {
+            if (feishu_prepare_agent_image(&msg) != OK) {
+                reply = strdup("图片获取失败，请稍后重试。");
+                if (!reply) goto task_done;
+            }
+        }
+#endif
+        if (!reply && (msg.flags & AGENT_MSG_FLAG_TOOL_JOB)) {
+            cJSON *job = cJSON_Parse(msg.content);
+            const char *name = cJSON_GetStringValue(cJSON_GetObjectItem(job, "tool"));
+            const char *args = cJSON_GetStringValue(cJSON_GetObjectItem(job, "args"));
+            const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(job, "text"));
+            bool notify = cJSON_IsTrue(cJSON_GetObjectItem(job, "notify"));
+            int rc = ERROR;
+            if (name && args) {
+                tool_output[0] = '\0';
+                rc = tool_registry_execute(name, args, tool_output, tool_size);
+                if (rc != OK) syslog(LOG_WARNING, "[%s] Scheduled tool %s failed: %.128s\n", TAG, name, tool_output);
+            }
+            if (notify && (rc == OK || strcmp(msg.channel, AGENT_CHAN_VOICE)))
+                reply = strdup(rc == OK && text ? text : "定时任务执行失败。");
+            cJSON_Delete(job);
+            if (!reply) goto task_done;
+        }
+        if (!reply && (msg.flags & AGENT_MSG_FLAG_NOTIFICATION)) {
+            reply = msg.content;
+            msg.content = NULL;
+            if (!reply) goto task_done;
+        }
+        /* Exact controls run before memory checks or model parsing. */
+        if (!reply && (msg.flags & (AGENT_MSG_FLAG_MUSIC_PAUSE | AGENT_MSG_FLAG_MUSIC_STOP))) {
+            reply = calloc(1, 256);
+            if (!reply) goto task_done;
+            tool_registry_execute((msg.flags & AGENT_MSG_FLAG_MUSIC_STOP)
+                ? "music_stop" : "music_pause", "{}", reply, 256);
+        }
+        if (reply) goto send_reply;
+
         /* Check memory pressure */
         agent_mem_get_status(&mem_st);
         if (mem_st.free_heap < AGENT_MEM_RESERVE_BYTES) {
@@ -1951,16 +1885,15 @@ static void* agent_loop_task(void* arg)
             out.flags = msg.flags;
             out.content = strdup("系统内存不足，请稍后再试。");
             if (out.content) {
-                if (message_bus_push_outbound(&out) != OK) {
+                if (message_bus_reply_and_wait(&out) != OK) {
                     free(out.content);
                 }
             }
-            free(msg.content);
-            continue;
+            goto task_done;
         }
 
         /* Slash commands — fast path, bypass LLM */
-        char* reply = handle_slash_command(&msg);
+        reply = handle_slash_command(&msg);
 
         /* Prompt injection check — before LLM */
         if (!reply && tool_guard_check_injection(msg.content)) {
@@ -1970,8 +1903,7 @@ static void* agent_loop_task(void* arg)
             reply = strdup("I can't do that.");
             if (!reply) {
                 /* Fail-closed: skip this message entirely */
-                free(msg.content);
-                continue;
+                goto task_done;
             }
         }
 
@@ -1982,11 +1914,19 @@ static void* agent_loop_task(void* arg)
             reply = handle_feishu_action_fast_path(&msg);
         }
 
+        /* A direct voice command such as "向前一步走" is an explicit
+         * physical side effect.  Execute it before the LLM path so a textual
+         * answer cannot silently replace the robot_move tool call. */
+        if (!reply && strcmp(msg.channel, AGENT_CHAN_VOICE) == 0) {
+            reply = handle_motion_fast_path(msg.content);
+        }
+
         /* NL fast path — after injection check, before LLM */
         if (!reply) {
             reply = handle_nl_fast_path(msg.content);
         }
 
+send_reply:
         if (reply) {
             agent_msg_t out = { 0 };
             strncpy(out.channel, msg.channel,
@@ -1995,11 +1935,10 @@ static void* agent_loop_task(void* arg)
                 sizeof(out.chat_id) - 1);
             out.flags = msg.flags;
             out.content = reply;
-            if (message_bus_push_outbound(&out) != OK) {
+            if (message_bus_reply_and_wait(&out) != OK) {
                 free(reply);
             }
-            free(msg.content);
-            continue;
+            goto task_done;
         }
 
         /* Hot-reload skills if directory changed */
@@ -2035,17 +1974,13 @@ static void* agent_loop_task(void* arg)
 
         dispatch_response(&msg, final_text);
 
-        /* Free image_b64 if not already freed by vision path */
-        free(msg.image_b64);
-        msg.image_b64 = NULL;
-        free(msg.content);
+task_done:
+        if (task_rc == OK)
+            tool_media_task_end(!agent_shutdown_requested());
+        message_bus_msg_free(&msg);
     }
 
     /* Cleanup (unreachable in normal operation) */
-    if (s_pool_ready) {
-        agent_pool_destroy(&s_tool_pool);
-        s_pool_ready = false;
-    }
     free(tools_json);
     free(sys_prompt);
     free(history_json);

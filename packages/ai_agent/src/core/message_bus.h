@@ -32,6 +32,20 @@
 
 /* Per-message delivery policy.  Zero keeps the default channel behavior. */
 #define AGENT_MSG_FLAG_NO_TTS (1u << 0)
+/* Contest-local music companion events are already handled by the media
+ * runtime.  The Agent must not run keyword fast paths or LLM tools on their
+ * embedded Skill text. */
+#define AGENT_MSG_FLAG_INTERNAL_MUSIC (1u << 1)
+/* Scheduling policy, carried in the existing flags word. */
+#define AGENT_MSG_FLAG_DEFER_MUSIC (1u << 2)
+#define AGENT_MSG_FLAG_MUSIC_PAUSE (1u << 3)
+#define AGENT_MSG_FLAG_MUSIC_STOP (1u << 4)
+#define AGENT_MSG_FLAG_TASK_REPLY (1u << 5)
+#define AGENT_MSG_FLAG_NOTIFICATION (1u << 6)
+#define AGENT_MSG_FLAG_TOOL_JOB (1u << 7)
+#define AGENT_MSG_FLAG_FEISHU_IMAGE (1u << 8)
+/* Non-speaking progress update within the current held task. */
+#define AGENT_MSG_FLAG_TASK_STATUS (1u << 9)
 
 /** A single message travelling on the bus. */
 typedef struct {
@@ -71,3 +85,14 @@ int message_bus_push_outbound(const agent_msg_t *msg);
 
 /** Block until an outbound message is available (or timeout expires). */
 int message_bus_pop_outbound(agent_msg_t *msg, uint32_t timeout_ms);
+
+/* Exact control commands only; never infer destructive actions from substrings. */
+uint32_t message_bus_music_control_flags(const char *text);
+/* Agent-only reply: ownership transfers on OK, including shutdown after enqueue.
+ * Waits for channel delivery AND synchronous TTS, using existing queue condvars. */
+int message_bus_reply_and_wait(agent_msg_t *msg);
+void message_bus_reply_complete(const agent_msg_t *msg);
+
+int message_bus_music_control_pending(void);
+
+bool agent_scheduler_can_resume_music(void);
